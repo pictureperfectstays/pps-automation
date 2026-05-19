@@ -1,0 +1,12 @@
+{
+  "name": "pps-daily-report",
+  "version": "1.0.0",
+  "description": "Daily revenue report email for Picture Perfect Stays",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

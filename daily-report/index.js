@@ -35,15 +35,23 @@ if (!RESEND_KEY) { console.error('Missing RESEND_API_KEY'); process.exit(1); }
 
 const SEND_TO = 'chris@staypictureperfect.com';
 const SEND_FROM = 'reports@mail.staypictureperfect.com';
+const LOGO_URL = 'https://vzozyzkaovegwfdmbcxg.supabase.co/storage/v1/object/public/assets/logo.png';
+const WEBSITE_URL = 'https://www.staypictureperfect.com';
+const INSTAGRAM_URL = 'https://www.instagram.com/pictureperfectstays';
 
-// targetPct: the market percentile this property targets (for color-coding demand vs price)
+// targetPct: the market percentile this property targets
 // Emerald Views targets p75-p90 (premium 1BR with 2BA)
 const PROPERTIES = [
-  { id: 5,  plId: '471179', name: 'Emerald Views',          location: 'Panama City Beach, FL', minPrice: 105, targetPct: 75, color: '#1a7f5a' },
-  { id: 6,  plId: '471178', name: 'Enchanted Getaway',      location: 'Sevierville, TN',        minPrice: null, targetPct: 50, color: '#5b4fcf' },
-  { id: 7,  plId: '471181', name: 'Musical Oasis',          location: 'Scottsdale, AZ',         minPrice: 90,  targetPct: 50, color: '#c0392b' },
-  { id: 8,  plId: '471180', name: 'Travelers Paradise',     location: 'Scottsdale, AZ',         minPrice: 100, targetPct: 50, color: '#d35400' },
+  { id: 5,  plId: '471179', name: 'Emerald Views',      location: 'Panama City Beach, FL', minPrice: 105, targetPct: 75, color: '#668CB3' },
+  { id: 6,  plId: '471178', name: 'Enchanted Getaway',  location: 'Sevierville, TN',        minPrice: null, targetPct: 50, color: '#D96666' },
+  { id: 7,  plId: '471181', name: 'Musical Oasis',      location: 'Scottsdale, AZ',         minPrice: 90,  targetPct: 50, color: '#737373' },
+  { id: 8,  plId: '471180', name: 'Travelers Paradise', location: 'Scottsdale, AZ',         minPrice: 100, targetPct: 50, color: '#65AD89' },
 ];
+
+// Channel host fees (deducted from your payout)
+const CHANNEL_FEE = { 'Airbnb': 0.03, 'Vrbo': 0.05, 'VRBO': 0.05, 'HomeAway': 0.05 };
+const channelFee = ch => CHANNEL_FEE[ch] || 0;
+const channelNet = (price, ch) => Math.round(price * (1 - channelFee(ch)));
 
 // ─── Date Helpers ─────────────────────────────────────────────────────────────
 
@@ -144,10 +152,42 @@ function gapNights(bookings, propId, from, to) {
       let d = gStart;
       while (d < gEnd) { dates.push(d); d = addDays(d, 1); }
       gaps.push({ nights, dates, checkOut: gStart, checkIn: gEnd,
-        prevGuest: sorted[i].guest_display_name, nextGuest: sorted[i+1].guest_display_name });
+        prevGuest: sorted[i].guest_display_name, prevChannel: sorted[i].booking_channel,
+        nextGuest: sorted[i+1].guest_display_name, nextChannel: sorted[i+1].booking_channel,
+      });
     }
   }
   return gaps;
+}
+
+// Build the discount offer table for a gap night
+function gapDiscountTable(basePrice, prevChannel, nextChannel) {
+  if (!basePrice || basePrice < 0) return '';
+  const channels = [...new Set([prevChannel, nextChannel].filter(Boolean))];
+  const tiers = [20, 25, 30, 35];
+  const channelHeaders = channels.map(ch =>
+    `<th style="padding:4px 8px;text-align:right;color:#555;font-weight:600;">Your Net (${ch})</th>`
+  ).join('');
+  let rows = '';
+  for (const pct of tiers) {
+    const guestPays = Math.round(basePrice * (1 - pct / 100));
+    const netCols = channels.map(ch =>
+      `<td style="padding:4px 8px;text-align:right;color:#555;">${fmt$(channelNet(guestPays, ch))}</td>`
+    ).join('');
+    const suggested = pct === 25;
+    rows += `<tr style="${suggested ? 'background:#f0f9f4;font-weight:700;' : ''}border-bottom:1px solid #f0f0f0;">
+      <td style="padding:4px 8px;color:${suggested ? '#1a7f5a' : '#333'};">${suggested ? '★ ' : ''}${pct}% off</td>
+      <td style="padding:4px 8px;text-align:right;">${fmt$(guestPays)}</td>
+      ${netCols}
+    </tr>`;
+  }
+  return `<table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:8px;">
+    <tr style="background:#f8f9fa;">
+      <th style="padding:4px 8px;text-align:left;color:#555;font-weight:600;">Offer</th>
+      <th style="padding:4px 8px;text-align:right;color:#555;font-weight:600;">Guest Pays</th>
+      ${channelHeaders}
+    </tr>${rows}
+  </table>`;
 }
 
 function revenueByProp(rows) {
@@ -161,6 +201,36 @@ function revenueByProp(rows) {
     r[row.property_id].count++;
   }
   return r;
+}
+
+// ─── Pricing Intelligence ────────────────────────────────────────────────────
+
+// Returns an urgency note object {text, color, bg} for a given open date, or null if no action needed.
+// Logic: as check-in approaches and/or demand is low, escalate urgency.
+function pricingUrgencyNote(daysOut, demandDesc, currentPrice, minPrice) {
+  const isLow  = demandDesc === 'Low Demand';
+  const isNorm = demandDesc === 'Normal Demand';
+  const floor  = minPrice || 0;
+  const drop10 = Math.max(floor, Math.round(currentPrice * 0.90));
+  const drop20 = Math.max(floor, Math.round(currentPrice * 0.80));
+  const drop30 = Math.max(floor, Math.round(currentPrice * 0.70));
+
+  if (daysOut <= 3) {
+    return { text: `🔴 Last chance — consider ${fmt$(drop30)}`, color: '#c0392b', bg: '#fef5f5' };
+  }
+  if (daysOut <= 7 && isLow) {
+    return { text: `🔴 7d out, low demand — try ${fmt$(drop20)}`, color: '#c0392b', bg: '#fef5f5' };
+  }
+  if (daysOut <= 7 && isNorm) {
+    return { text: `🟡 7d out — monitor daily`, color: '#e67e22', bg: '#fffbf3' };
+  }
+  if (daysOut <= 14 && isLow) {
+    return { text: `🟡 14d out, low demand — consider ${fmt$(drop10)}`, color: '#e67e22', bg: '#fffbf3' };
+  }
+  if (daysOut <= 30 && isLow) {
+    return { text: `👀 30d out, low demand`, color: '#888', bg: '' };
+  }
+  return null;
 }
 
 // ─── HTML Helpers ─────────────────────────────────────────────────────────────
@@ -256,7 +326,7 @@ function sectionActivity({ newBookings, cancellations }) {
   return html;
 }
 
-function sectionOpenNights(bookings, todayStr) {
+function sectionOpenNights(bookings, plData, todayStr) {
   const t30 = addDays(todayStr, 30), t60 = addDays(todayStr, 60), t90 = addDays(todayStr, 90);
   let html = `<h2 style="${H2}">📅 Open Nights & Gap Opportunities</h2>`;
 
@@ -291,13 +361,23 @@ function sectionOpenNights(bookings, todayStr) {
       </table>`;
 
     if (gaps.length) {
-      html += `<div style="margin-top:8px;padding:8px 12px;background:#fff8e1;border-radius:6px;border-left:3px solid #f39c12;">
-        <div style="font-size:12px;font-weight:700;color:#e67e22;margin-bottom:4px;">⚡ Gap Nights — outreach opportunity</div>`;
+      html += `<div style="margin-top:8px;padding:10px 14px;background:#fff8e1;border-radius:6px;border-left:3px solid #f39c12;">
+        <div style="font-size:12px;font-weight:700;color:#e67e22;margin-bottom:8px;">⚡ Gap Nights — outreach opportunities (${gaps.length})</div>`;
       for (const g of gaps) {
-        html += `<div style="font-size:13px;padding:3px 0;color:#555;">
-          <strong>${g.nights === 1 ? '1 night' : `${g.nights} nights`}:</strong>
-          ${g.dates.map(fmtDateL).join(', ')}
-          <span style="color:#999;font-size:12px;"> (prev checkout ${fmtDate(g.checkOut)} → next checkin ${fmtDate(g.checkIn)})</span>
+        const basePriceNote = plData ? '' : '';
+        // Try to get PL price for the first gap date
+        const plPrice = plData?.[p.plId]?.[g.dates[0]]?.price ?? null;
+        html += `<div style="margin-bottom:${gaps.indexOf(g) < gaps.length-1 ? '14px' : '0'};padding-bottom:${gaps.indexOf(g) < gaps.length-1 ? '14px' : '0'};border-bottom:${gaps.indexOf(g) < gaps.length-1 ? '1px solid #f0e0a0' : 'none'};">
+          <div style="font-size:13px;margin-bottom:4px;">
+            <strong>${g.nights === 1 ? '1-night gap' : `${g.nights}-night gap`}:</strong>
+            ${g.dates.map(fmtDateL).join(', ')}
+          </div>
+          <div style="font-size:12px;color:#888;margin-bottom:4px;">
+            ← ${g.prevGuest || 'Guest'} checkout ${fmtDate(g.checkOut)} (${g.prevChannel || 'Direct'})
+            &nbsp;·&nbsp;
+            ${g.nextGuest || 'Guest'} checkin ${fmtDate(g.checkIn)} (${g.nextChannel || 'Direct'}) →
+          </div>
+          ${plPrice ? gapDiscountTable(plPrice, g.prevChannel, g.nextChannel) : `<div style="font-size:12px;color:#aaa;font-style:italic;">PL price not available — add PRICELABS_DATA_FILE for discount table</div>`}
         </div>`;
       }
       html += `</div>`;
@@ -360,14 +440,18 @@ function sectionPrices(bookings, plData, todayStr) {
         const demColor = DEMAND_COLOR[r.demand_desc] || '#888';
         const isOverride = r.user_price > 0 && r.user_price !== r.price;
         const isUnbookable = r.unbookable === 1;
-        const rowBg = isUnbookable ? '#fffbf3' : '';
+        const daysOut = diffDays(todayStr, r.date);
+        const urgencyNote = pricingUrgencyNote(daysOut, r.demand_desc, r.price, p.minPrice);
+        const rowBg = isUnbookable ? '#fffbf3' : urgencyNote?.bg || '';
         html += `<tr style="border-bottom:1px solid #f0f0f0;background:${rowBg}">
           <td style="padding:5px 8px;">${fmtDateL(r.date)}</td>
           <td style="padding:5px 8px;text-align:right;font-weight:600;">${fmt$(r.price)}</td>
           <td style="padding:5px 8px;text-align:right;${isOverride?'font-weight:600;color:#2980b9;':'color:#ccc;'}">${isOverride ? fmt$(r.user_price) : '—'}</td>
           <td style="padding:5px 8px;text-align:right;color:#666;">${r.min_stay ?? '—'}</td>
           <td style="padding:5px 8px;">${r.demand_desc ? badge(r.demand_desc, demColor) : ''}</td>
-          <td style="padding:5px 8px;font-size:11px;color:#e67e22;">${isUnbookable ? '⚠ unbookable' : ''}</td>
+          <td style="padding:5px 8px;font-size:11px;">
+            ${isUnbookable ? '<span style="color:#e67e22;">⚠ unbookable</span>' : urgencyNote ? `<span style="color:${urgencyNote.color};">${urgencyNote.text}</span>` : ''}
+          </td>
         </tr>`;
       }
       html += `</table>`;
@@ -387,6 +471,10 @@ const TH = `padding:7px 12px;text-align:left;font-weight:600;color:#555;`;
 const TD = `padding:6px 12px;border-bottom:1px solid #f0f0f0;`;
 const SECTION = `background:#fff;border-radius:8px;padding:20px 24px;margin-bottom:16px;border:1px solid #e8e8e8;`;
 
+// Instagram SVG icon (inline, no external dependency)
+const INSTAGRAM_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="5" ry="5"/><path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"/><line x1="17.5" y1="6.5" x2="17.51" y2="6.5"/></svg>`;
+const GLOBE_SVG    = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`;
+
 function buildEmail(todayStr, sections) {
   const timeStr = new Date().toLocaleString('en-US', {
     timeZone: 'America/Phoenix', hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
@@ -397,16 +485,27 @@ function buildEmail(todayStr, sections) {
 <body style="margin:0;padding:0;background:#f4f5f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#222;">
 <div style="max-width:680px;margin:0 auto;padding:20px 16px;">
 
-  <div style="background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:10px;padding:24px 28px;margin-bottom:16px;color:#fff;">
-    <div style="font-size:11px;text-transform:uppercase;letter-spacing:1.5px;color:#7a9bbf;margin-bottom:6px;">Picture Perfect Stays</div>
-    <div style="font-size:22px;font-weight:700;">Daily Revenue Report</div>
+  <!-- Header -->
+  <div style="background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:10px;padding:20px 28px 24px;margin-bottom:16px;color:#fff;">
+    <img src="${LOGO_URL}" alt="Picture Perfect Stays" style="height:48px;width:auto;margin-bottom:14px;display:block;" />
+    <div style="font-size:22px;font-weight:700;letter-spacing:-0.3px;">Daily Revenue Report</div>
     <div style="font-size:13px;color:#7a9bbf;margin-top:4px;">${fmtDateL(todayStr)} · ${timeStr}</div>
   </div>
 
   ${sections.map(s => `<div style="${SECTION}">${s}</div>`).join('')}
 
-  <div style="text-align:center;padding:12px;font-size:11px;color:#bbb;">
-    Picture Perfect Stays · Daily automated report · <a href="mailto:chris@staypictureperfect.com" style="color:#bbb;">chris@staypictureperfect.com</a>
+  <!-- Footer -->
+  <div style="background:#fff;border-radius:8px;border:1px solid #e8e8e8;padding:20px 24px;text-align:center;">
+    <img src="${LOGO_URL}" alt="Picture Perfect Stays" style="height:40px;width:auto;margin-bottom:12px;display:block;margin-left:auto;margin-right:auto;" />
+    <div style="display:flex;align-items:center;justify-content:center;gap:20px;flex-wrap:wrap;">
+      <a href="${WEBSITE_URL}" style="display:inline-flex;align-items:center;gap:5px;color:#555;text-decoration:none;font-size:12px;">
+        <span style="color:#668CB3;">${GLOBE_SVG}</span> staypictureperfect.com
+      </a>
+      <a href="${INSTAGRAM_URL}" style="display:inline-flex;align-items:center;gap:5px;color:#555;text-decoration:none;font-size:12px;">
+        <span style="color:#E1306C;">${INSTAGRAM_SVG}</span> @pictureperfectstays
+      </a>
+    </div>
+    <div style="font-size:11px;color:#bbb;margin-top:10px;">Daily automated report · <a href="mailto:chris@staypictureperfect.com" style="color:#bbb;">chris@staypictureperfect.com</a></div>
   </div>
 
 </div></body></html>`;
@@ -427,11 +526,41 @@ async function sendEmail(html, subject) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
+// Sample PriceLabs data for preview mode — realistic demo prices
+function buildSamplePlData(bookings, todayStr) {
+  const DEMAND_POOL = ['Low Demand','Low Demand','Normal Demand','Normal Demand','High Demand','Very High Demand'];
+  const BASE = { 5: 260, 6: 195, 7: 105, 8: 110 };
+  const data = {};
+  for (const p of PROPERTIES) {
+    data[p.plId] = {};
+    const occ = occupiedSet(bookings, p.id);
+    for (let i = 0; i < 90; i++) {
+      const d = addDays(todayStr, i);
+      if (occ.has(d)) continue;
+      const dow = new Date(d + 'T00:00:00Z').getUTCDay();
+      const isWknd = dow === 5 || dow === 6;
+      const base = BASE[p.id] * (isWknd ? 1.3 : 1) * (1 + i / 400);
+      const demand = DEMAND_POOL[Math.floor(Math.random() * DEMAND_POOL.length)];
+      const hasOverride = Math.random() < 0.12;
+      data[p.plId][d] = {
+        price: Math.round(base),
+        user_price: hasOverride ? Math.round(base * 1.1) : -1,
+        demand_desc: demand,
+        min_stay: isWknd ? 3 : 2,
+        unbookable: demand === 'Low Demand' && !isWknd && Math.random() < 0.15 ? 1 : 0,
+        booking_status: '',
+      };
+    }
+  }
+  return data;
+}
+
 async function main() {
   const todayStr = today();
   const t90 = addDays(todayStr, 90);
+  const PREVIEW_OUT = ENV.PREVIEW_OUT;
 
-  console.log(`Daily report for ${todayStr}`);
+  console.log(`Daily report for ${todayStr}${PREVIEW_OUT ? ' [PREVIEW MODE]' : ''}`);
 
   const [activity, mtd, bookings] = await Promise.all([
     fetchRecentActivity(),
@@ -441,18 +570,31 @@ async function main() {
 
   console.log(`  Bookings (90d): ${bookings.length} | New: ${activity.newBookings.length} | Cancelled: ${activity.cancellations.length} | MTD: ${mtd.cur.length}`);
 
-  const plData = loadPriceLabsData();
-  console.log(`  PriceLabs data: ${plData ? 'loaded from ' + PL_DATA_FILE : 'not available'}`);
+  // In preview mode, generate sample PL data if no file provided
+  let plData = loadPriceLabsData();
+  if (!plData && PREVIEW_OUT) {
+    console.log('  PriceLabs data: generating sample data for preview');
+    plData = buildSamplePlData(bookings, todayStr);
+  } else {
+    console.log(`  PriceLabs data: ${plData ? 'loaded from ' + PL_DATA_FILE : 'not available'}`);
+  }
 
   const sections = [
     sectionMTD(mtd, todayStr),
     sectionActivity(activity),
-    sectionOpenNights(bookings, todayStr),
+    sectionOpenNights(bookings, plData, todayStr),
     sectionPrices(bookings, plData, todayStr),
   ];
 
   const html = buildEmail(todayStr, sections);
   const subject = `PPS Daily Report · ${fmtDateL(todayStr)}`;
+
+  if (PREVIEW_OUT) {
+    const { writeFileSync } = await import('fs');
+    writeFileSync(PREVIEW_OUT, html);
+    console.log(`  ✓ Preview written to: ${PREVIEW_OUT}`);
+    return;
+  }
 
   console.log('  Sending via Resend...');
   const result = await sendEmail(html, subject);

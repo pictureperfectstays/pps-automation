@@ -49,7 +49,18 @@ const PROPERTIES = [
 ];
 
 // Channel host fees (deducted from your payout)
-const CHANNEL_FEE = { 'Airbnb': 0.03, 'Vrbo': 0.05, 'VRBO': 0.05, 'HomeAway': 0.05 };
+// Airbnb: 15.5% host-only fee
+// VRBO/Vrbo: 5% VRBO fee + 3% payment processing = 8%
+// Booking.com: ~18% (confirm exact rate — ranges 15–20%)
+// Direct: 0%
+const CHANNEL_FEE = {
+  'Airbnb':      0.155,
+  'Vrbo':        0.08,
+  'VRBO':        0.08,
+  'HomeAway':    0.08,
+  'Booking.com': 0.18,
+  'Booking':     0.18,
+};
 const channelFee = ch => CHANNEL_FEE[ch] || 0;
 const channelNet = (price, ch) => Math.round(price * (1 - channelFee(ch)));
 
@@ -79,10 +90,20 @@ async function sb(path) {
 
 async function fetchBookings90(fromDate, toDate) {
   return sb(
-    `bookings?select=id,property_id,guest_display_name,arrival_date,departure_date,nights,gross_revenue,net_revenue,booking_channel,booked_at`
+    `bookings?select=id,property_id,guest_display_name,arrival_date,departure_date,nights,gross_revenue,net_revenue,booking_channel,booked_at,charges_json`
     + `&status=in.(active,blocked)&arrival_date=lt.${toDate}&departure_date=gt.${fromDate}`
     + `&order=arrival_date.asc`
   );
+}
+
+// Extract rent-per-night from a booking's charges_json
+// This is the OwnerRez base rent (= PriceLabs net target), NOT the marked-up channel price
+function rentPerNight(booking) {
+  if (!booking) return null;
+  const charges = booking.charges_json || [];
+  const totalRent = charges.filter(c => c.type === 'rent').reduce((s, c) => s + (c.amount || 0), 0);
+  const nights = booking.nights || 1;
+  return totalRent > 0 ? totalRent / nights : null;
 }
 
 async function fetchRecentActivity() {
@@ -103,6 +124,18 @@ async function fetchMTDRevenue(todayStr) {
     sb(`bookings?select=property_id,gross_revenue,net_revenue,nights&status=eq.active&arrival_date=gte.${lyStart}&arrival_date=lte.${lyToday}`),
   ]);
   return { cur, ly, thisStart, lyStart };
+}
+
+// ─── Tax Rules ────────────────────────────────────────────────────────────────
+
+async function fetchTaxRates() {
+  // Returns { 5: 0.13, 6: 0.1275, 7: 0.1402, 8: 0.1402 }
+  const rows = await sb('tax_rules?is_active=eq.true&select=property_id,rate');
+  const totals = {};
+  for (const row of rows) {
+    totals[row.property_id] = (totals[row.property_id] || 0) + Number(row.rate) / 100;
+  }
+  return totals;
 }
 
 // ─── PriceLabs Data (supplied externally by CoWork routine) ───────────────────
@@ -151,9 +184,14 @@ function gapNights(bookings, propId, from, to) {
       const dates = [];
       let d = gStart;
       while (d < gEnd) { dates.push(d); d = addDays(d, 1); }
+      const prevRPN = rentPerNight(sorted[i]);
+      const nextRPN = rentPerNight(sorted[i+1]);
+      // Use average of adjacent bookings' nightly rate as the gap discount base
+      const baseRPN = (prevRPN && nextRPN) ? (prevRPN + nextRPN) / 2 : (prevRPN || nextRPN);
       gaps.push({ nights, dates, checkOut: gStart, checkIn: gEnd,
         prevGuest: sorted[i].guest_display_name, prevChannel: sorted[i].booking_channel,
         nextGuest: sorted[i+1].guest_display_name, nextChannel: sorted[i+1].booking_channel,
+        baseRentPerNight: baseRPN ? Math.round(baseRPN * 100) / 100 : null,
       });
     }
   }
@@ -161,30 +199,43 @@ function gapNights(bookings, propId, from, to) {
 }
 
 // Build the discount offer table for a gap night
-function gapDiscountTable(basePrice, prevChannel, nextChannel) {
-  if (!basePrice || basePrice < 0) return '';
+// baseRentPerNight = charges_json rent / nights from adjacent booking (= PriceLabs net target)
+// taxRate = total property tax rate as a decimal (e.g. 0.13)
+// prevChannel / nextChannel = booking channels of adjacent guests
+function gapDiscountTable(baseRentPerNight, taxRate, prevChannel, nextChannel) {
+  if (!baseRentPerNight || baseRentPerNight < 0) return '';
+  const tax = taxRate || 0;
   const channels = [...new Set([prevChannel, nextChannel].filter(Boolean))];
   const tiers = [20, 25, 30, 35];
+
+  // Column headers — one "Your Net" per unique channel
   const channelHeaders = channels.map(ch =>
-    `<th style="padding:4px 8px;text-align:right;color:#555;font-weight:600;">Your Net (${ch})</th>`
+    `<th style="padding:5px 8px;text-align:right;color:#555;font-weight:600;">Your Net<br><span style="font-weight:400;font-size:10px;">${ch}</span></th>`
   ).join('');
+
   let rows = '';
   for (const pct of tiers) {
-    const guestPays = Math.round(basePrice * (1 - pct / 100));
+    // Guest's per-night rent after discount (what they pay for rent, excl. taxes)
+    const discountedRent = Math.round(baseRentPerNight * (1 - pct / 100) * 100) / 100;
+    // Total guest pays per gap night including all taxes
+    const guestTotal = Math.round(discountedRent * (1 + tax) * 100) / 100;
+    // Chris's net per night from rent (after channel fee, taxes go to authorities)
     const netCols = channels.map(ch =>
-      `<td style="padding:4px 8px;text-align:right;color:#555;">${fmt$(channelNet(guestPays, ch))}</td>`
+      `<td style="padding:5px 8px;text-align:right;color:#555;">${fmt$(Math.round(discountedRent * (1 - channelFee(ch))))}</td>`
     ).join('');
     const suggested = pct === 25;
     rows += `<tr style="${suggested ? 'background:#f0f9f4;font-weight:700;' : ''}border-bottom:1px solid #f0f0f0;">
-      <td style="padding:4px 8px;color:${suggested ? '#1a7f5a' : '#333'};">${suggested ? '★ ' : ''}${pct}% off</td>
-      <td style="padding:4px 8px;text-align:right;">${fmt$(guestPays)}</td>
+      <td style="padding:5px 8px;color:${suggested ? '#1a7f5a' : '#333'};">${suggested ? '★ ' : ''}${pct}% off</td>
+      <td style="padding:5px 8px;text-align:right;">${fmt$(discountedRent)}</td>
+      <td style="padding:5px 8px;text-align:right;font-weight:${suggested?'700':'400'};">${fmt$(guestTotal)}</td>
       ${netCols}
     </tr>`;
   }
   return `<table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:8px;">
     <tr style="background:#f8f9fa;">
-      <th style="padding:4px 8px;text-align:left;color:#555;font-weight:600;">Offer</th>
-      <th style="padding:4px 8px;text-align:right;color:#555;font-weight:600;">Guest Pays</th>
+      <th style="padding:5px 8px;text-align:left;color:#555;font-weight:600;">Offer</th>
+      <th style="padding:5px 8px;text-align:right;color:#555;font-weight:600;">Rent/Night</th>
+      <th style="padding:5px 8px;text-align:right;color:#555;font-weight:600;">Guest Pays<br><span style="font-weight:400;font-size:10px;">incl. ${(tax*100).toFixed(2)}% tax</span></th>
       ${channelHeaders}
     </tr>${rows}
   </table>`;
@@ -326,7 +377,7 @@ function sectionActivity({ newBookings, cancellations }) {
   return html;
 }
 
-function sectionOpenNights(bookings, plData, todayStr) {
+function sectionOpenNights(bookings, todayStr, taxRates) {
   const t30 = addDays(todayStr, 30), t60 = addDays(todayStr, 60), t90 = addDays(todayStr, 90);
   let html = `<h2 style="${H2}">📅 Open Nights & Gap Opportunities</h2>`;
 
@@ -361,23 +412,25 @@ function sectionOpenNights(bookings, plData, todayStr) {
       </table>`;
 
     if (gaps.length) {
+      const propTaxRate = taxRates?.[p.id] || 0;
       html += `<div style="margin-top:8px;padding:10px 14px;background:#fff8e1;border-radius:6px;border-left:3px solid #f39c12;">
         <div style="font-size:12px;font-weight:700;color:#e67e22;margin-bottom:8px;">⚡ Gap Nights — outreach opportunities (${gaps.length})</div>`;
       for (const g of gaps) {
-        const basePriceNote = plData ? '' : '';
-        // Try to get PL price for the first gap date
-        const plPrice = plData?.[p.plId]?.[g.dates[0]]?.price ?? null;
-        html += `<div style="margin-bottom:${gaps.indexOf(g) < gaps.length-1 ? '14px' : '0'};padding-bottom:${gaps.indexOf(g) < gaps.length-1 ? '14px' : '0'};border-bottom:${gaps.indexOf(g) < gaps.length-1 ? '1px solid #f0e0a0' : 'none'};">
-          <div style="font-size:13px;margin-bottom:4px;">
+        const isLast = gaps.indexOf(g) === gaps.length - 1;
+        html += `<div style="margin-bottom:${isLast ? '0' : '16px'};padding-bottom:${isLast ? '0' : '16px'};border-bottom:${isLast ? 'none' : '1px solid #f0e0a0'};">
+          <div style="font-size:13px;margin-bottom:3px;">
             <strong>${g.nights === 1 ? '1-night gap' : `${g.nights}-night gap`}:</strong>
             ${g.dates.map(fmtDateL).join(', ')}
           </div>
-          <div style="font-size:12px;color:#888;margin-bottom:4px;">
+          <div style="font-size:12px;color:#888;margin-bottom:6px;">
             ← ${g.prevGuest || 'Guest'} checkout ${fmtDate(g.checkOut)} (${g.prevChannel || 'Direct'})
             &nbsp;·&nbsp;
             ${g.nextGuest || 'Guest'} checkin ${fmtDate(g.checkIn)} (${g.nextChannel || 'Direct'}) →
           </div>
-          ${plPrice ? gapDiscountTable(plPrice, g.prevChannel, g.nextChannel) : `<div style="font-size:12px;color:#aaa;font-style:italic;">PL price not available — add PRICELABS_DATA_FILE for discount table</div>`}
+          ${g.baseRentPerNight
+            ? gapDiscountTable(g.baseRentPerNight, propTaxRate, g.prevChannel, g.nextChannel)
+            : `<p style="font-size:12px;color:#aaa;font-style:italic;margin:4px 0;">Rent data unavailable for discount calculation</p>`
+          }
         </div>`;
       }
       html += `</div>`;
@@ -486,10 +539,14 @@ function buildEmail(todayStr, sections) {
 <div style="max-width:680px;margin:0 auto;padding:20px 16px;">
 
   <!-- Header -->
-  <div style="background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:10px;padding:20px 28px 24px;margin-bottom:16px;color:#fff;">
-    <img src="${LOGO_URL}" alt="Picture Perfect Stays" style="height:48px;width:auto;margin-bottom:14px;display:block;" />
-    <div style="font-size:22px;font-weight:700;letter-spacing:-0.3px;">Daily Revenue Report</div>
-    <div style="font-size:13px;color:#7a9bbf;margin-top:4px;">${fmtDateL(todayStr)} · ${timeStr}</div>
+  <div style="background:#fff;border-radius:10px;padding:20px 28px 18px;margin-bottom:16px;border:1px solid #e2e8f0;border-top:4px solid #406A94;">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+      <img src="${LOGO_URL}" alt="Picture Perfect Stays" style="height:44px;width:auto;display:block;" />
+      <div style="text-align:right;">
+        <div style="font-size:18px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">Daily Revenue Report</div>
+        <div style="font-size:12px;color:#64748b;margin-top:2px;">${fmtDateL(todayStr)} · ${timeStr}</div>
+      </div>
+    </div>
   </div>
 
   ${sections.map(s => `<div style="${SECTION}">${s}</div>`).join('')}
@@ -562,10 +619,11 @@ async function main() {
 
   console.log(`Daily report for ${todayStr}${PREVIEW_OUT ? ' [PREVIEW MODE]' : ''}`);
 
-  const [activity, mtd, bookings] = await Promise.all([
+  const [activity, mtd, bookings, taxRates] = await Promise.all([
     fetchRecentActivity(),
     fetchMTDRevenue(todayStr),
     fetchBookings90(todayStr, t90),
+    fetchTaxRates(),
   ]);
 
   console.log(`  Bookings (90d): ${bookings.length} | New: ${activity.newBookings.length} | Cancelled: ${activity.cancellations.length} | MTD: ${mtd.cur.length}`);
@@ -582,7 +640,7 @@ async function main() {
   const sections = [
     sectionMTD(mtd, todayStr),
     sectionActivity(activity),
-    sectionOpenNights(bookings, plData, todayStr),
+    sectionOpenNights(bookings, todayStr, taxRates),
     sectionPrices(bookings, plData, todayStr),
   ];
 

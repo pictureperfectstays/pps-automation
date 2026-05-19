@@ -3,3 +3,5 @@ node_modules/
 .env
 .env.local
 generate-preview.mjs
+logo-b64.txt
+logo.png

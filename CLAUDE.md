@@ -106,7 +106,8 @@ body: { listings: [{ id: "471179", pms: "ownerrez", min: 105, base: 228 }] }
 ## GitHub repos
 - Owner Portal: `github.com/pictureperfectstays/picture-perfect-stays-portal`
 - Revenue Estimator: `github.com/pictureperfectstays/pictureperfectstays-revenue`
-- Both are private — need GitHub Personal Access Token to read via API
+- Automation scripts: `github.com/pictureperfectstays/pps-automation` (this repo — daily report, future automation)
+- All private — need GitHub Personal Access Token to read via API
 
 ---
 

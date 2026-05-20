@@ -563,16 +563,16 @@ function buildEmail(todayStr, sections) {
 <body style="margin:0;padding:0;background:#f4f5f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#222;">
 <div style="max-width:760px;margin:0 auto;padding:20px 16px;">
 
-  <!-- Header — table layout for email client compatibility -->
+  <!-- Header -->
   <div style="background:#fff;border-radius:10px;padding:16px 24px;margin-bottom:16px;border:1px solid #e2e8f0;border-top:4px solid #406A94;">
-    <table width="100%" cellpadding="0" cellspacing="0" border="0">
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;">
       <tr>
-        <td valign="middle" width="60">
-          <img src="${LOGO_URL}" alt="PPS" height="52" style="display:block;" />
+        <td style="width:64px;min-width:64px;vertical-align:middle;padding:0;">
+          <img src="${LOGO_URL}" width="60" height="52" alt="Picture Perfect Stays" style="display:block;border:0;outline:none;width:60px;height:52px;" />
         </td>
-        <td valign="middle" style="padding-left:14px;">
-          <div style="font-size:19px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">Daily Revenue Report</div>
-          <div style="font-size:12px;color:#64748b;margin-top:2px;">${fmtDateL(todayStr)} · ${timeStr}</div>
+        <td style="vertical-align:middle;padding:0 0 0 14px;text-align:right;">
+          <p style="margin:0;padding:0;font-size:20px;font-weight:700;color:#0f172a;font-family:-apple-system,BlinkMacSystemFont,Arial,sans-serif;">Daily Revenue Report</p>
+          <p style="margin:3px 0 0;padding:0;font-size:12px;color:#64748b;font-family:-apple-system,BlinkMacSystemFont,Arial,sans-serif;">${fmtDateL(todayStr)} · ${timeStr}</p>
         </td>
       </tr>
     </table>

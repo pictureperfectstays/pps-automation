@@ -524,9 +524,7 @@ const TH = `padding:7px 12px;text-align:left;font-weight:600;color:#555;`;
 const TD = `padding:6px 12px;border-bottom:1px solid #f0f0f0;`;
 const SECTION = `background:#fff;border-radius:8px;padding:20px 24px;margin-bottom:16px;border:1px solid #e8e8e8;`;
 
-// Instagram SVG icon (inline, no external dependency)
-const INSTAGRAM_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="5" ry="5"/><path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"/><line x1="17.5" y1="6.5" x2="17.51" y2="6.5"/></svg>`;
-const GLOBE_SVG    = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`;
+// Note: SVG icons are stripped by Gmail — using emoji instead for universal rendering
 
 function buildEmail(todayStr, sections) {
   const timeStr = new Date().toLocaleString('en-US', {
@@ -536,7 +534,7 @@ function buildEmail(todayStr, sections) {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Daily Revenue Report</title></head>
 <body style="margin:0;padding:0;background:#f4f5f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#222;">
-<div style="max-width:680px;margin:0 auto;padding:20px 16px;">
+<div style="max-width:760px;margin:0 auto;padding:20px 16px;">
 
   <!-- Header -->
   <div style="background:#fff;border-radius:10px;padding:20px 28px 18px;margin-bottom:16px;border:1px solid #e2e8f0;border-top:4px solid #406A94;">
@@ -553,16 +551,17 @@ function buildEmail(todayStr, sections) {
 
   <!-- Footer -->
   <div style="background:#fff;border-radius:8px;border:1px solid #e8e8e8;padding:20px 24px;text-align:center;">
-    <img src="${LOGO_URL}" alt="Picture Perfect Stays" style="height:40px;width:auto;margin-bottom:12px;display:block;margin-left:auto;margin-right:auto;" />
-    <div style="display:flex;align-items:center;justify-content:center;gap:20px;flex-wrap:wrap;">
-      <a href="${WEBSITE_URL}" style="display:inline-flex;align-items:center;gap:5px;color:#555;text-decoration:none;font-size:12px;">
-        <span style="color:#668CB3;">${GLOBE_SVG}</span> staypictureperfect.com
+    <img src="${LOGO_URL}" alt="Picture Perfect Stays" style="height:44px;width:auto;margin-bottom:14px;display:block;margin-left:auto;margin-right:auto;" />
+    <div style="margin-bottom:8px;">
+      <a href="${WEBSITE_URL}" style="color:#406A94;text-decoration:none;font-size:13px;font-weight:500;">
+        🌐 staypictureperfect.com
       </a>
-      <a href="${INSTAGRAM_URL}" style="display:inline-flex;align-items:center;gap:5px;color:#555;text-decoration:none;font-size:12px;">
-        <span style="color:#E1306C;">${INSTAGRAM_SVG}</span> @pictureperfectstays
+      &nbsp;&nbsp;·&nbsp;&nbsp;
+      <a href="${INSTAGRAM_URL}" style="color:#E1306C;text-decoration:none;font-size:13px;font-weight:500;">
+        📷 @pictureperfectstays
       </a>
     </div>
-    <div style="font-size:11px;color:#bbb;margin-top:10px;">Daily automated report · <a href="mailto:chris@staypictureperfect.com" style="color:#bbb;">chris@staypictureperfect.com</a></div>
+    <div style="font-size:11px;color:#bbb;">Daily automated report · <a href="mailto:chris@staypictureperfect.com" style="color:#bbb;">chris@staypictureperfect.com</a></div>
   </div>
 
 </div></body></html>`;

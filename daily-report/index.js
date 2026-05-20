@@ -4,9 +4,11 @@
 // Required env: SUPABASE_URL, SUPABASE_SERVICE_KEY, RESEND_API_KEY
 // Optional env: PRICELABS_API_KEY (enables pricing section — key in ~/.claude/settings.json)
 
-import { readFileSync } from 'fs';
-import { join } from 'path';
+import { readFileSync, existsSync } from 'fs';
+import { join, dirname } from 'path';
 import { homedir } from 'os';
+import { fileURLToPath } from 'url';
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ─── Credentials ─────────────────────────────────────────────────────────────
 
@@ -14,7 +16,10 @@ function loadEnv() {
   const env = { ...process.env };
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) {
     try {
-      const settings = JSON.parse(readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8'));
+      const localPath = join(__dirname, 'settings.json');
+      const globalPath = join(homedir(), '.claude', 'settings.json');
+      const settingsPath = existsSync(localPath) ? localPath : globalPath;
+      const settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
       if (settings.env) Object.assign(env, settings.env);
     } catch {}
   }

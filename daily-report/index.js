@@ -473,7 +473,7 @@ function sectionPrices(bookings, plData, todayStr) {
 
   if (!plData) {
     html += `<p style="color:#888;font-style:italic;font-size:13px;">
-      PriceLabs data not available. Add PRICELABS_API_KEY to ~/.claude/settings.json to enable this section.
+      PriceLabs prices unavailable right now — this typically happens during their overnight recalculation (usually complete by 6am AZ time). The 7am scheduled send will have full pricing data.
     </p>`;
     return html;
   }

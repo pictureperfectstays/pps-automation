@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 // Daily Revenue Report — Picture Perfect Stays
-// Run directly:  node index.js
-// With PriceLabs: PRICELABS_DATA_FILE=/tmp/pl.json node index.js
-// Required env:  SUPABASE_URL, SUPABASE_SERVICE_KEY, RESEND_API_KEY
-// Optional env:  PRICELABS_DATA_FILE (path to JSON written by the CoWork routine)
+// Run: node index.js
+// Required env: SUPABASE_URL, SUPABASE_SERVICE_KEY, RESEND_API_KEY
+// Optional env: PRICELABS_API_KEY (enables pricing section — key in ~/.claude/settings.json)
 
 import { readFileSync } from 'fs';
 import { join } from 'path';
@@ -26,7 +25,8 @@ const ENV = loadEnv();
 const SUPABASE_URL = ENV.SUPABASE_URL;
 const SUPABASE_KEY = ENV.SUPABASE_SERVICE_KEY;
 const RESEND_KEY = ENV.RESEND_API_KEY;
-const PL_DATA_FILE = ENV.PRICELABS_DATA_FILE;
+const PRICELABS_KEY = ENV.PRICELABS_API_KEY;
+const PL_DATA_FILE = ENV.PRICELABS_DATA_FILE; // fallback: load from file if set
 
 if (!SUPABASE_URL || !SUPABASE_KEY) { console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY'); process.exit(1); }
 if (!RESEND_KEY) { console.error('Missing RESEND_API_KEY'); process.exit(1); }
@@ -36,6 +36,7 @@ if (!RESEND_KEY) { console.error('Missing RESEND_API_KEY'); process.exit(1); }
 const SEND_TO = 'chris@staypictureperfect.com';
 const SEND_FROM = 'reports@mail.staypictureperfect.com';
 const LOGO_URL = 'https://vzozyzkaovegwfdmbcxg.supabase.co/storage/v1/object/public/assets/logo.png';
+const INSTAGRAM_ICON_URL = 'https://vzozyzkaovegwfdmbcxg.supabase.co/storage/v1/object/public/assets/instagram-icon.png';
 const WEBSITE_URL = 'https://www.staypictureperfect.com';
 const INSTAGRAM_URL = 'https://www.instagram.com/pictureperfectstays';
 
@@ -141,14 +142,40 @@ async function fetchTaxRates() {
 // ─── PriceLabs Data (supplied externally by CoWork routine) ───────────────────
 // Format: { "471179": { "2026-05-27": { price, user_price, demand_desc, min_stay, unbookable, booking_status }, ... }, ... }
 
-function loadPriceLabsData() {
-  if (!PL_DATA_FILE) return null;
-  try {
-    return JSON.parse(readFileSync(PL_DATA_FILE, 'utf8'));
-  } catch (e) {
-    console.warn('Could not read PRICELABS_DATA_FILE:', e.message);
-    return null;
+// Fetch prices from PriceLabs REST API for all 4 properties
+// Returns plData in format: { "471179": { "YYYY-MM-DD": { price, user_price, demand_desc, min_stay, unbookable, booking_status } } }
+async function fetchPriceLabsData(fromDate, toDate) {
+  if (!PRICELABS_KEY) return null;
+  const listings = PROPERTIES.map(p => ({ id: p.plId, pms: 'ownerrez', dateFrom: fromDate, dateTo: toDate }));
+  const res = await fetch('https://api.pricelabs.co/v1/listing_prices', {
+    method: 'POST',
+    headers: { 'X-API-Key': PRICELABS_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ listings }),
+  });
+  if (!res.ok) { console.warn('PriceLabs API error:', res.status, await res.text()); return null; }
+  const raw = await res.json();
+  // Transform: array of { id, data: [...] } → { plId: { date: priceObj } }
+  const plData = {};
+  for (const listing of (Array.isArray(raw) ? raw : (raw.listings || []))) {
+    plData[listing.id] = {};
+    for (const row of (listing.data || listing.prices || [])) {
+      if (row.booking_status === '') {   // only open/available dates
+        plData[listing.id][row.date] = {
+          price: row.price, user_price: row.user_price,
+          demand_desc: row.demand_desc, min_stay: row.min_stay,
+          unbookable: row.unbookable, booking_status: row.booking_status,
+        };
+      }
+    }
   }
+  return plData;
+}
+
+// Fallback: load PriceLabs data from a pre-generated JSON file (CoWork routine path)
+function loadPriceLabsFile() {
+  if (!PL_DATA_FILE) return null;
+  try { return JSON.parse(readFileSync(PL_DATA_FILE, 'utf8')); }
+  catch (e) { console.warn('Could not read PRICELABS_DATA_FILE:', e.message); return null; }
 }
 
 // ─── Business Logic ───────────────────────────────────────────────────────────
@@ -446,7 +473,7 @@ function sectionPrices(bookings, plData, todayStr) {
 
   if (!plData) {
     html += `<p style="color:#888;font-style:italic;font-size:13px;">
-      PriceLabs data not available. To enable this section, the CoWork routine supplies price data via PRICELABS_DATA_FILE.
+      PriceLabs data not available. Add PRICELABS_API_KEY to ~/.claude/settings.json to enable this section.
     </p>`;
     return html;
   }
@@ -536,15 +563,19 @@ function buildEmail(todayStr, sections) {
 <body style="margin:0;padding:0;background:#f4f5f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#222;">
 <div style="max-width:760px;margin:0 auto;padding:20px 16px;">
 
-  <!-- Header -->
-  <div style="background:#fff;border-radius:10px;padding:20px 28px 18px;margin-bottom:16px;border:1px solid #e2e8f0;border-top:4px solid #406A94;">
-    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
-      <img src="${LOGO_URL}" alt="Picture Perfect Stays" style="height:44px;width:auto;display:block;" />
-      <div style="text-align:right;">
-        <div style="font-size:18px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">Daily Revenue Report</div>
-        <div style="font-size:12px;color:#64748b;margin-top:2px;">${fmtDateL(todayStr)} · ${timeStr}</div>
-      </div>
-    </div>
+  <!-- Header — table layout for email client compatibility -->
+  <div style="background:#fff;border-radius:10px;padding:16px 24px;margin-bottom:16px;border:1px solid #e2e8f0;border-top:4px solid #406A94;">
+    <table width="100%" cellpadding="0" cellspacing="0" border="0">
+      <tr>
+        <td valign="middle" width="60">
+          <img src="${LOGO_URL}" alt="PPS" height="52" style="display:block;" />
+        </td>
+        <td valign="middle" style="padding-left:14px;">
+          <div style="font-size:19px;font-weight:700;color:#0f172a;letter-spacing:-0.3px;">Daily Revenue Report</div>
+          <div style="font-size:12px;color:#64748b;margin-top:2px;">${fmtDateL(todayStr)} · ${timeStr}</div>
+        </td>
+      </tr>
+    </table>
   </div>
 
   ${sections.map(s => `<div style="${SECTION}">${s}</div>`).join('')}
@@ -552,15 +583,22 @@ function buildEmail(todayStr, sections) {
   <!-- Footer -->
   <div style="background:#fff;border-radius:8px;border:1px solid #e8e8e8;padding:20px 24px;text-align:center;">
     <img src="${LOGO_URL}" alt="Picture Perfect Stays" style="height:44px;width:auto;margin-bottom:14px;display:block;margin-left:auto;margin-right:auto;" />
-    <div style="margin-bottom:8px;">
-      <a href="${WEBSITE_URL}" style="color:#406A94;text-decoration:none;font-size:13px;font-weight:500;">
-        🌐 staypictureperfect.com
-      </a>
-      &nbsp;&nbsp;·&nbsp;&nbsp;
-      <a href="${INSTAGRAM_URL}" style="color:#E1306C;text-decoration:none;font-size:13px;font-weight:500;">
-        📷 @pictureperfectstays
-      </a>
-    </div>
+    <table cellpadding="0" cellspacing="0" border="0" style="margin:0 auto 8px;">
+      <tr>
+        <td style="padding:0 12px;vertical-align:middle;text-align:center;">
+          <a href="${WEBSITE_URL}" style="color:#406A94;text-decoration:none;font-size:13px;font-weight:500;">
+            🌐 staypictureperfect.com
+          </a>
+        </td>
+        <td style="color:#ccc;font-size:16px;vertical-align:middle;">·</td>
+        <td style="padding:0 12px;vertical-align:middle;text-align:center;">
+          <a href="${INSTAGRAM_URL}" style="display:inline-block;text-decoration:none;vertical-align:middle;">
+            <img src="${INSTAGRAM_ICON_URL}" alt="Instagram" width="20" height="20" style="display:inline-block;vertical-align:middle;border:0;" />
+            <span style="color:#E1306C;font-size:13px;font-weight:500;vertical-align:middle;margin-left:4px;">@pictureperfectstays</span>
+          </a>
+        </td>
+      </tr>
+    </table>
     <div style="font-size:11px;color:#bbb;">Daily automated report · <a href="mailto:chris@staypictureperfect.com" style="color:#bbb;">chris@staypictureperfect.com</a></div>
   </div>
 
@@ -627,14 +665,18 @@ async function main() {
 
   console.log(`  Bookings (90d): ${bookings.length} | New: ${activity.newBookings.length} | Cancelled: ${activity.cancellations.length} | MTD: ${mtd.cur.length}`);
 
-  // In preview mode, generate sample PL data if no file provided
-  let plData = loadPriceLabsData();
+  // PriceLabs: try REST API first, then file fallback, then preview sample
+  let plData = loadPriceLabsFile();
+  if (!plData && PRICELABS_KEY) {
+    console.log('  Fetching PriceLabs prices from API...');
+    try { plData = await fetchPriceLabsData(todayStr, t90); }
+    catch (e) { console.warn('  PriceLabs API fetch failed:', e.message); }
+  }
   if (!plData && PREVIEW_OUT) {
     console.log('  PriceLabs data: generating sample data for preview');
     plData = buildSamplePlData(bookings, todayStr);
-  } else {
-    console.log(`  PriceLabs data: ${plData ? 'loaded from ' + PL_DATA_FILE : 'not available'}`);
   }
+  console.log(`  PriceLabs data: ${plData ? 'loaded (' + Object.keys(plData).length + ' listings)' : 'not available'}`);
 
   const sections = [
     sectionMTD(mtd, todayStr),

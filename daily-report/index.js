@@ -321,29 +321,26 @@ function computePropertyAlerts(prop, plData, alertData, todayStr) {
     const mktOcc  = win.mktOcc;
     const hasOccData = propOcc != null && mktOcc != null;
 
-    // Do NOT flag if property occupancy is at/above market — that's correct peak-season behavior
     const occupancyBeatMarket = hasOccData && propOcc >= mktOcc;
-    if (occupancyBeatMarket) continue;
-
-    const occupancyGap      = hasOccData ? mktOcc - propOcc : 0;
-    const occupancyHalfMkt  = hasOccData && mktOcc > 0 && propOcc < mktOcc * 0.5;
+    const occupancyGap        = hasOccData ? mktOcc - propOcc : 0;
+    const occupancyHalfMkt    = hasOccData && mktOcc > 0 && propOcc < mktOcc * 0.5;
 
     let level = null, reason = null;
 
-    if (hasOccData) {
-      if (occupancyHalfMkt) {
-        level = 'RED'; reason = 'occupancy_gap';
-      } else if (pctAboveP75 > 0.30 && occupancyGap > 0.10) {
-        level = 'RED'; reason = 'overpriced';
+    // Do NOT flag if property occupancy is at/above market — correct peak-season behavior
+    if (!occupancyBeatMarket) {
+      if (hasOccData) {
+        if (occupancyHalfMkt) { level = 'RED'; reason = 'occupancy_gap'; }
+        else if (pctAboveP75 > 0.30 && occupancyGap > 0.10) { level = 'RED'; reason = 'overpriced'; }
       }
+      if (!level && pctAboveP75 > 0.20) { level = 'YELLOW'; reason = 'overpriced'; }
+      if (!level && avgP50 > 0 && avgPrice > avgP50 * 1.15) { level = 'YELLOW'; reason = 'above_market'; }
     }
-    if (!level && pctAboveP75 > 0.20) { level = 'YELLOW'; reason = 'overpriced'; }
-    if (!level && avgP50 > 0 && avgPrice > avgP50 * 1.15) { level = 'YELLOW'; reason = 'above_market'; }
-    if (!level) continue;
-
     const ptsAbove = avgP50 > 0 ? Math.round((avgPrice / avgP50 - 1) * 100) : 0;
     let action;
-    if (level === 'RED' && reason === 'overpriced') {
+    if (!level) {
+      action = '✓ Within normal range';
+    } else if (level === 'RED' && reason === 'overpriced') {
       action = `Review and reduce pricing for ${win.label}. Currently ${ptsAbove}% above market median.`;
     } else if (level === 'RED' && reason === 'occupancy_gap') {
       action = 'Pricing may not be the issue — check listing rank and reviews on Airbnb/VRBO.';
@@ -354,7 +351,7 @@ function computePropertyAlerts(prop, plData, alertData, todayStr) {
     }
 
     alerts.push({
-      window: win.label, level,
+      window: win.label, level: level || 'OK',
       avgPrice: Math.round(avgPrice),
       mktP50:   Math.round(avgP50),
       nightsAboveP75, totalNights: datesWithPrice.length,
@@ -378,25 +375,23 @@ function sectionPricingAlerts(plData, alertData, todayStr) {
   const YLW_BG = '#fffbf0', YLW_COLOR = '#d97706', YLW_BADGE = '#fef3c7';
   const GRN_COLOR = '#1a7f5a';
 
-  // Collect all alerts across all properties
-  const allAlerts = [];
+  // Collect rows for ALL properties × ALL windows (not just alerting ones)
+  const allRows = [];
   for (const prop of PROPERTIES) {
-    const propAlerts = computePropertyAlerts(prop, plData, alertData, todayStr);
-    propAlerts.forEach(a => allAlerts.push({ prop, ...a }));
+    const propRows = computePropertyAlerts(prop, plData, alertData, todayStr);
+    propRows.forEach(a => allRows.push({ prop, ...a }));
   }
 
-  if (allAlerts.length === 0) {
-    return html + `<div style="padding:12px 16px;background:#f0faf5;border-radius:8px;border-left:3px solid ${GRN_COLOR};font-size:13px;color:${GRN_COLOR};font-weight:600;">
-      ✓ All properties pricing within normal range
-    </div>`;
-  }
-
-  const redAlerts = allAlerts.filter(a => a.level === 'RED');
-  const ylwAlerts = allAlerts.filter(a => a.level === 'YELLOW');
+  const redAlerts = allRows.filter(a => a.level === 'RED');
+  const ylwAlerts = allRows.filter(a => a.level === 'YELLOW');
 
   if (redAlerts.length) {
     html += `<div style="padding:6px 12px;background:${RED_BADGE};border-radius:6px;margin-bottom:10px;font-size:12px;color:${RED_COLOR};font-weight:700;">
-      🔴 ${redAlerts.length} RED alert${redAlerts.length > 1 ? 's' : ''} require immediate attention
+      🔴 ${redAlerts.length} RED alert${redAlerts.length > 1 ? 's' : ''} — immediate attention needed
+    </div>`;
+  } else if (ylwAlerts.length === 0) {
+    html += `<div style="padding:6px 12px;background:#f0faf5;border-radius:6px;margin-bottom:10px;font-size:12px;color:${GRN_COLOR};font-weight:600;">
+      ✓ All properties pricing within normal range
     </div>`;
   }
 
@@ -404,30 +399,33 @@ function sectionPricingAlerts(plData, alertData, todayStr) {
     <tr style="background:#f8f9fa;">
       <th style="${TH}">Property</th>
       <th style="${TH}">Window</th>
-      <th style="${TH}text-align:center;">Alert</th>
+      <th style="${TH}text-align:center;">Status</th>
       <th style="${TH}text-align:right;">Avg Price</th>
       <th style="${TH}text-align:right;">Mkt Median</th>
       <th style="${TH}text-align:right;">Nights &gt;p75</th>
       <th style="${TH}text-align:right;">Occ / Mkt</th>
-      <th style="${TH}">Recommended Action</th>
+      <th style="${TH}">Action</th>
     </tr>`;
 
-  for (const a of allAlerts) {
+  for (const a of allRows) {
     const isRed = a.level === 'RED';
-    const rowBg = isRed ? RED_BG : YLW_BG;
-    const levelColor = isRed ? RED_COLOR : YLW_COLOR;
+    const isYlw = a.level === 'YELLOW';
+    const isOK  = a.level === 'OK';
+    const rowBg     = isRed ? RED_BG : isYlw ? YLW_BG : '#fff';
+    const levelColor = isRed ? RED_COLOR : isYlw ? YLW_COLOR : GRN_COLOR;
+    const levelLabel = isOK ? '✓ OK' : a.level;
     const occStr = a.propOcc != null && a.mktOcc != null ? `${a.propOcc}% / ${a.mktOcc}%` : '—';
     html += `<tr style="background:${rowBg};border-bottom:1px solid #f0f0f0;">
       <td style="padding:7px 10px;">${badge(a.prop.name, a.prop.color)}</td>
       <td style="padding:7px 10px;color:#555;">${a.window}</td>
       <td style="padding:7px 10px;text-align:center;">
-        <span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;background:${levelColor}22;color:${levelColor};">${a.level}</span>
+        <span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;background:${levelColor}22;color:${levelColor};">${levelLabel}</span>
       </td>
       <td style="padding:7px 10px;text-align:right;font-weight:600;">${fmt$(a.avgPrice)}</td>
       <td style="padding:7px 10px;text-align:right;color:#666;">${fmt$(a.mktP50)}</td>
       <td style="padding:7px 10px;text-align:right;color:#666;">${a.nightsAboveP75} / ${a.totalNights}</td>
       <td style="padding:7px 10px;text-align:right;color:#666;">${occStr}</td>
-      <td style="padding:7px 10px;color:#444;font-size:11px;">${a.action}</td>
+      <td style="padding:7px 10px;color:${isOK ? '#888' : '#444'};font-size:11px;">${a.action}</td>
     </tr>`;
   }
   html += `</table>`;

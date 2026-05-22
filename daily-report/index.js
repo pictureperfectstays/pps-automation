@@ -162,15 +162,16 @@ async function fetchPriceLabsData(fromDate, toDate) {
   // Transform: array of { id, data: [...] } → { plId: { date: priceObj } }
   const plData = {};
   for (const listing of (Array.isArray(raw) ? raw : (raw.listings || []))) {
+    if (listing.error) { console.warn(`PriceLabs ${listing.id}: ${listing.error_status}`); continue; }
     plData[listing.id] = {};
     for (const row of (listing.data || listing.prices || [])) {
-      if (row.booking_status === '') {   // only open/available dates
-        plData[listing.id][row.date] = {
-          price: row.price, user_price: row.user_price,
-          demand_desc: row.demand_desc, min_stay: row.min_stay,
-          unbookable: row.unbookable, booking_status: row.booking_status,
-        };
-      }
+      // Store ALL dates — sectionPrices filters to open dates via Supabase bookings;
+      // sectionPricingAlerts needs all dates (including booked) for price analysis
+      plData[listing.id][row.date] = {
+        price: row.price, user_price: row.user_price,
+        demand_desc: row.demand_desc, min_stay: row.min_stay,
+        unbookable: row.unbookable, booking_status: row.booking_status,
+      };
     }
   }
   return plData;
@@ -181,6 +182,256 @@ function loadPriceLabsFile() {
   if (!PL_DATA_FILE) return null;
   try { return JSON.parse(readFileSync(PL_DATA_FILE, 'utf8')); }
   catch (e) { console.warn('Could not read PRICELABS_DATA_FILE:', e.message); return null; }
+}
+
+// ─── PriceLabs Pricing Alerts ─────────────────────────────────────────────────
+
+async function plGet(path) {
+  const res = await fetch(`https://api.pricelabs.co/v1${path}`, {
+    headers: { 'X-API-Key': PRICELABS_KEY },
+  });
+  if (!res.ok) { console.warn(`PriceLabs GET ${path} ${res.status}`); return null; }
+  return res.json();
+}
+
+// Fetch listing settings (occupancy vs market) + neighborhood market percentiles for all properties
+async function fetchPricingAlertData() {
+  if (!PRICELABS_KEY) return null;
+  try {
+    // /listings returns all 4 with occupancy_next_30/60 and market_occupancy_next_30/60
+    const allSettings = await plGet('/listings').then(d => d?.listings || []).catch(() => []);
+
+    // Neighborhood data (market percentiles) per property — these are large, fetch in parallel
+    const marketResults = await Promise.all(
+      PROPERTIES.map(p =>
+        plGet(`/neighborhood_data?pms=ownerrez&listing_id=${p.plId}`)
+          .then(d => ({ plId: p.plId, data: d }))
+          .catch(() => ({ plId: p.plId, data: null }))
+      )
+    );
+
+    const result = {};
+    for (const p of PROPERTIES) {
+      result[p.plId] = {
+        settings: allSettings.find(s => String(s.id) === p.plId) || null,
+        market:   marketResults.find(r => r.plId === p.plId)?.data || null,
+      };
+    }
+    return result;
+  } catch (e) {
+    console.warn('  Pricing alert data fetch failed:', e.message);
+    return null;
+  }
+}
+
+// Parse "25 %" → 0.25, null/undefined → null
+function parseOcc(str) {
+  if (str == null) return null;
+  const n = parseFloat(str);
+  return isNaN(n) ? null : n / 100;
+}
+
+// Convert cumulative occupancy (occ_next_30, occ_next_60) to per-window rates
+// window 30 = days 1-30, window 60 = days 31-60
+function windowOcc(occ30str, occ60str, windowEnd) {
+  const o30 = parseOcc(occ30str) ?? 0;
+  const o60 = parseOcc(occ60str) ?? 0;
+  if (windowEnd === 30) return o30;
+  if (windowEnd === 60) return Math.max(0, (o60 * 60 - o30 * 30) / 30);
+  return null; // 61-90 not available
+}
+
+// Build date → { p25, p50, p75 } lookup from neighborhood_data for a given bedroom count
+function parseMarketPercentiles(marketData, bedroomCount) {
+  if (!marketData?.data) return {};
+  const fpp = marketData.data['Future Percentile Prices'];
+  if (!fpp?.Category) return {};
+
+  // Category keys are bedroom counts as strings; fall back to "1" if exact key missing
+  const catKey = String(bedroomCount);
+  const category = fpp.Category[catKey] || fpp.Category['1'] || Object.values(fpp.Category)[0];
+  if (!category) return {};
+
+  const dates   = category.X_values || [];
+  const yVals   = category.Y_values || [];
+  const p25s = yVals[0] || [], p50s = yVals[1] || [], p75s = yVals[2] || [];
+
+  const map = {};
+  dates.forEach((d, i) => {
+    map[d] = { p25: p25s[i] ?? null, p50: p50s[i] ?? null, p75: p75s[i] ?? null };
+  });
+  return map;
+}
+
+// Compute alerts for a single property across three windows
+function computePropertyAlerts(prop, plData, alertData, todayStr) {
+  const propAlertData = alertData?.[prop.plId];
+  if (!propAlertData?.settings || !propAlertData?.market) return [];
+
+  const { settings, market } = propAlertData;
+  const bedroomCount = settings.no_of_bedrooms ?? 1;
+  const percentiles  = parseMarketPercentiles(market, bedroomCount);
+  const prices       = plData?.[prop.plId] ?? {};
+
+  const windows = [
+    {
+      label:    'Next 30 days',
+      startDay: 0, endDay: 30,
+      propOcc:  windowOcc(settings.occupancy_next_30, settings.occupancy_next_60, 30),
+      mktOcc:   windowOcc(settings.market_occupancy_next_30, settings.market_occupancy_next_60, 30),
+    },
+    {
+      label:    'Days 31–60',
+      startDay: 30, endDay: 60,
+      propOcc:  windowOcc(settings.occupancy_next_30, settings.occupancy_next_60, 60),
+      mktOcc:   windowOcc(settings.market_occupancy_next_30, settings.market_occupancy_next_60, 60),
+    },
+    {
+      label:    'Days 61–90',
+      startDay: 60, endDay: 90,
+      propOcc:  null, // not available from API
+      mktOcc:   null,
+    },
+  ];
+
+  const alerts = [];
+
+  for (const win of windows) {
+    // Collect all dates in this window that have a price (booked or open)
+    const windowDates = [];
+    for (let i = win.startDay; i < win.endDay; i++) windowDates.push(addDays(todayStr, i));
+
+    const datesWithPrice = windowDates.filter(d => prices[d]?.price != null && prices[d].price > 0);
+    if (datesWithPrice.length === 0) continue;
+
+    // Use `price` field only — this is the final channel price (what guests see)
+    const avgPrice = datesWithPrice.reduce((s, d) => s + prices[d].price, 0) / datesWithPrice.length;
+
+    // Market percentile averages for this window
+    const mktPoints = windowDates.map(d => percentiles[d]).filter(Boolean);
+    if (mktPoints.length === 0) continue;
+    const avgP50 = mktPoints.reduce((s, m) => s + (m.p50 ?? 0), 0) / mktPoints.length;
+    const avgP75 = mktPoints.reduce((s, m) => s + (m.p75 ?? 0), 0) / mktPoints.length;
+    if (!avgP50 || !avgP75) continue;
+
+    const nightsAboveP75 = datesWithPrice.filter(d => prices[d].price > avgP75).length;
+    const pctAboveP75    = nightsAboveP75 / datesWithPrice.length;
+
+    const propOcc = win.propOcc;
+    const mktOcc  = win.mktOcc;
+    const hasOccData = propOcc != null && mktOcc != null;
+
+    // Do NOT flag if property occupancy is at/above market — that's correct peak-season behavior
+    const occupancyBeatMarket = hasOccData && propOcc >= mktOcc;
+    if (occupancyBeatMarket) continue;
+
+    const occupancyGap      = hasOccData ? mktOcc - propOcc : 0;
+    const occupancyHalfMkt  = hasOccData && mktOcc > 0 && propOcc < mktOcc * 0.5;
+
+    let level = null, reason = null;
+
+    if (hasOccData) {
+      if (occupancyHalfMkt) {
+        level = 'RED'; reason = 'occupancy_gap';
+      } else if (pctAboveP75 > 0.30 && occupancyGap > 0.10) {
+        level = 'RED'; reason = 'overpriced';
+      }
+    }
+    if (!level && pctAboveP75 > 0.20) { level = 'YELLOW'; reason = 'overpriced'; }
+    if (!level && avgP50 > 0 && avgPrice > avgP50 * 1.15) { level = 'YELLOW'; reason = 'above_market'; }
+    if (!level) continue;
+
+    const ptsAbove = avgP50 > 0 ? Math.round((avgPrice / avgP50 - 1) * 100) : 0;
+    let action;
+    if (level === 'RED' && reason === 'overpriced') {
+      action = `Review and reduce pricing for ${win.label}. Currently ${ptsAbove}% above market median.`;
+    } else if (level === 'RED' && reason === 'occupancy_gap') {
+      action = 'Pricing may not be the issue — check listing rank and reviews on Airbnb/VRBO.';
+    } else if (reason === 'overpriced') {
+      action = `Monitor — ${nightsAboveP75} of ${datesWithPrice.length} nights above 75th percentile.`;
+    } else {
+      action = `Monitor — avg price ${ptsAbove}% above market median.`;
+    }
+
+    alerts.push({
+      window: win.label, level,
+      avgPrice: Math.round(avgPrice),
+      mktP50:   Math.round(avgP50),
+      nightsAboveP75, totalNights: datesWithPrice.length,
+      propOcc: propOcc != null ? Math.round(propOcc * 100) : null,
+      mktOcc:  mktOcc  != null ? Math.round(mktOcc  * 100) : null,
+      action,
+    });
+  }
+
+  return alerts;
+}
+
+function sectionPricingAlerts(plData, alertData, todayStr) {
+  let html = `<h2 style="${H2}">🚨 Pricing Alerts</h2>`;
+
+  if (!PRICELABS_KEY || !alertData || !plData) {
+    return html + `<p style="color:#888;font-style:italic;font-size:13px;">PriceLabs data required for pricing alerts.</p>`;
+  }
+
+  const RED_BG = '#fff0f0', RED_COLOR = '#c0392b', RED_BADGE = '#fde8e8';
+  const YLW_BG = '#fffbf0', YLW_COLOR = '#d97706', YLW_BADGE = '#fef3c7';
+  const GRN_COLOR = '#1a7f5a';
+
+  // Collect all alerts across all properties
+  const allAlerts = [];
+  for (const prop of PROPERTIES) {
+    const propAlerts = computePropertyAlerts(prop, plData, alertData, todayStr);
+    propAlerts.forEach(a => allAlerts.push({ prop, ...a }));
+  }
+
+  if (allAlerts.length === 0) {
+    return html + `<div style="padding:12px 16px;background:#f0faf5;border-radius:8px;border-left:3px solid ${GRN_COLOR};font-size:13px;color:${GRN_COLOR};font-weight:600;">
+      ✓ All properties pricing within normal range
+    </div>`;
+  }
+
+  const redAlerts = allAlerts.filter(a => a.level === 'RED');
+  const ylwAlerts = allAlerts.filter(a => a.level === 'YELLOW');
+
+  if (redAlerts.length) {
+    html += `<div style="padding:6px 12px;background:${RED_BADGE};border-radius:6px;margin-bottom:10px;font-size:12px;color:${RED_COLOR};font-weight:700;">
+      🔴 ${redAlerts.length} RED alert${redAlerts.length > 1 ? 's' : ''} require immediate attention
+    </div>`;
+  }
+
+  html += `<table style="width:100%;border-collapse:collapse;font-size:12px;">
+    <tr style="background:#f8f9fa;">
+      <th style="${TH}">Property</th>
+      <th style="${TH}">Window</th>
+      <th style="${TH}text-align:center;">Alert</th>
+      <th style="${TH}text-align:right;">Avg Price</th>
+      <th style="${TH}text-align:right;">Mkt Median</th>
+      <th style="${TH}text-align:right;">Nights &gt;p75</th>
+      <th style="${TH}text-align:right;">Occ / Mkt</th>
+      <th style="${TH}">Recommended Action</th>
+    </tr>`;
+
+  for (const a of allAlerts) {
+    const isRed = a.level === 'RED';
+    const rowBg = isRed ? RED_BG : YLW_BG;
+    const levelColor = isRed ? RED_COLOR : YLW_COLOR;
+    const occStr = a.propOcc != null && a.mktOcc != null ? `${a.propOcc}% / ${a.mktOcc}%` : '—';
+    html += `<tr style="background:${rowBg};border-bottom:1px solid #f0f0f0;">
+      <td style="padding:7px 10px;">${badge(a.prop.name, a.prop.color)}</td>
+      <td style="padding:7px 10px;color:#555;">${a.window}</td>
+      <td style="padding:7px 10px;text-align:center;">
+        <span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;background:${levelColor}22;color:${levelColor};">${a.level}</span>
+      </td>
+      <td style="padding:7px 10px;text-align:right;font-weight:600;">${fmt$(a.avgPrice)}</td>
+      <td style="padding:7px 10px;text-align:right;color:#666;">${fmt$(a.mktP50)}</td>
+      <td style="padding:7px 10px;text-align:right;color:#666;">${a.nightsAboveP75} / ${a.totalNights}</td>
+      <td style="padding:7px 10px;text-align:right;color:#666;">${occStr}</td>
+      <td style="padding:7px 10px;color:#444;font-size:11px;">${a.action}</td>
+    </tr>`;
+  }
+  html += `</table>`;
+  return html;
 }
 
 // ─── Business Logic ───────────────────────────────────────────────────────────
@@ -683,11 +934,20 @@ async function main() {
   }
   console.log(`  PriceLabs data: ${plData ? 'loaded (' + Object.keys(plData).length + ' listings)' : 'not available'}`);
 
+  // Pricing alerts: listing settings + neighborhood market percentiles
+  let alertData = null;
+  if (PRICELABS_KEY && plData) {
+    console.log('  Fetching pricing alert data (settings + market percentiles)...');
+    try { alertData = await fetchPricingAlertData(); }
+    catch (e) { console.warn('  Pricing alert fetch failed:', e.message); }
+  }
+
   const sections = [
     sectionMTD(mtd, todayStr),
     sectionActivity(activity),
     sectionOpenNights(bookings, todayStr, taxRates),
     sectionPrices(bookings, plData, todayStr),
+    sectionPricingAlerts(plData, alertData, todayStr),
   ];
 
   const html = buildEmail(todayStr, sections);

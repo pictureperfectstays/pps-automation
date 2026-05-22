@@ -140,14 +140,21 @@ body: { listings: [{ id: "471179", pms: "ownerrez", min: 105, base: 228 }] }
 - **Daily revenue email report (Phase 1 COMPLETE)** — `daily-report/index.js`
   - Sends from `reports@mail.staypictureperfect.com` via Resend
   - Sections: MTD revenue YoY, 24h activity, open nights + gap discount tables, PriceLabs pricing
-  - CoWork routine scheduled: `trig_01ErnBxPftR8ZJN2r9j4o9JQ`, cron `0 14 * * *` (7am AZ)
   - Logo + Instagram icon hosted on Supabase Storage (`assets` bucket)
-  - **Routine test pending** — remote Node.js availability unconfirmed; local `node index.js` works perfectly
+  - Scheduling: GitHub Actions is the agreed approach (not yet configured — next session)
+- **Pricing Alerts section (COMPLETE)** — proactive RED/YELLOW per property × 3 windows
+  - Uses `price` field only (final channel price, not user_price/uncustomized_price)
+  - Neighborhood data category = bedroom count key; Y_values for Occ is double-nested (Y_values[0][0])
+  - 61-90 day market occ intentionally null (advance-booking bias makes it unreliable)
+  - Actions are directive: "Reduce prices in PriceLabs..." not "Monitor..."
 
-**Phase 2 (next session — revenue management intelligence):**
-- Priority Action Board at top of email (Claude writes plain-English briefing with specific $ recommendations)
-- Booking pace vs last year (ahead/behind per property)
+**Phase 2 — in progress:**
+- **Booking Pace vs Last Year (NEXT)** — spec agreed, ready to build next session
+  - Use `booked_at` NOT `created_at` (created_at is Supabase insert date, useless for pace)
+  - Prorate revenue across month boundaries by nights
+  - Include current month if >= 7 days remain; otherwise show next 3 full months
+  - Status = 'active', revenue field = gross_revenue
 - Revenue forecast (projected month-end based on pace + historical fill rates)
-- Smart event detection (Cardinals games, spring break, foliage) calibrated to actual historical ADR — don't blindly follow PriceLabs on events
+- Smart event detection (Cardinals games, spring break, foliage) calibrated to actual historical ADR
 
-**Also planned:** Seasonal price floor automation, Owner Portal auth upgrade (magic link), Invoice/Stripe, Revenue estimator, Client onboarding
+**Also planned:** GitHub Actions daily schedule, seasonal price floor automation, Owner Portal auth upgrade (magic link), Invoice/Stripe, Revenue estimator, Client onboarding

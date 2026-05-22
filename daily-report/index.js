@@ -326,7 +326,10 @@ function computePropertyAlerts(prop, plData, alertData, bookings, todayStr) {
       label:    'Days 61–90',
       startDay: 60, endDay: 90,
       propOcc:  propOccFromBookings(bookings, prop.id, 60, 90, todayStr),
-      mktOcc:   mktOcc61_90,
+      // Market occ from neighborhood_data is unreliable for 61-90 day window —
+      // it reflects advance bookings already made, not true market occupancy.
+      // Use null so alert logic falls back to pricing thresholds only.
+      mktOcc:   null,
     },
   ];
 

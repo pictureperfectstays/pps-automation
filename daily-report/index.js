@@ -249,8 +249,10 @@ function parseMarketOccupancy(marketData, bedroomCount) {
   const catKey = String(bedroomCount);
   const category = foc.Category[catKey] || foc.Category['1'] || Object.values(foc.Category)[0];
   if (!category) return {};
-  const dates   = category.X_values || [];
-  const occSeries = (category.Y_values || [])[0] || []; // Label[0] = "Occupancy"
+  const dates = category.X_values || [];
+  // Future Occ Y_values is double-nested: Y_values[0][0] = actual data array
+  const rawOcc    = (category.Y_values || [])[0];
+  const occSeries = Array.isArray(rawOcc?.[0]) ? rawOcc[0] : (rawOcc || []); // Label[0] = "Occupancy"
   const map = {};
   dates.forEach((d, i) => { if (occSeries[i] != null) map[d] = occSeries[i] / 100; });
   return map;

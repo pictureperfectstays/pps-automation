@@ -241,6 +241,31 @@ function windowOcc(occ30str, occ60str, windowEnd) {
   return null; // 61-90 not available
 }
 
+// Build date → market occupancy rate lookup from neighborhood_data "Future Occ/New/Canc"
+function parseMarketOccupancy(marketData, bedroomCount) {
+  if (!marketData?.data) return {};
+  const foc = marketData.data['Future Occ/New/Canc'];
+  if (!foc?.Category) return {};
+  const catKey = String(bedroomCount);
+  const category = foc.Category[catKey] || foc.Category['1'] || Object.values(foc.Category)[0];
+  if (!category) return {};
+  const dates   = category.X_values || [];
+  const occSeries = (category.Y_values || [])[0] || []; // Label[0] = "Occupancy"
+  const map = {};
+  dates.forEach((d, i) => { if (occSeries[i] != null) map[d] = occSeries[i] / 100; });
+  return map;
+}
+
+// Property occupancy for a specific day window, calculated from Supabase bookings
+function propOccFromBookings(bookings, propId, startDay, endDay, todayStr) {
+  const occ = occupiedSet(bookings, propId);
+  let booked = 0;
+  for (let i = startDay; i < endDay; i++) {
+    if (occ.has(addDays(todayStr, i))) booked++;
+  }
+  return booked / (endDay - startDay);
+}
+
 // Build date → { p25, p50, p75 } lookup from neighborhood_data for a given bedroom count
 function parseMarketPercentiles(marketData, bedroomCount) {
   if (!marketData?.data) return {};
@@ -264,14 +289,23 @@ function parseMarketPercentiles(marketData, bedroomCount) {
 }
 
 // Compute alerts for a single property across three windows
-function computePropertyAlerts(prop, plData, alertData, todayStr) {
+function computePropertyAlerts(prop, plData, alertData, bookings, todayStr) {
   const propAlertData = alertData?.[prop.plId];
   if (!propAlertData?.settings || !propAlertData?.market) return [];
 
   const { settings, market } = propAlertData;
-  const bedroomCount = settings.no_of_bedrooms ?? 1;
-  const percentiles  = parseMarketPercentiles(market, bedroomCount);
-  const prices       = plData?.[prop.plId] ?? {};
+  const bedroomCount  = settings.no_of_bedrooms ?? 1;
+  const percentiles   = parseMarketPercentiles(market, bedroomCount);
+  const mktOccByDate  = parseMarketOccupancy(market, bedroomCount);
+  const prices        = plData?.[prop.plId] ?? {};
+
+  // Market occupancy for days 61-90: average from neighborhood_data occupancy series
+  const mktOcc61_90Dates = [];
+  for (let i = 60; i < 90; i++) mktOcc61_90Dates.push(addDays(todayStr, i));
+  const mktOcc61_90Values = mktOcc61_90Dates.map(d => mktOccByDate[d]).filter(v => v != null);
+  const mktOcc61_90 = mktOcc61_90Values.length
+    ? mktOcc61_90Values.reduce((s, v) => s + v, 0) / mktOcc61_90Values.length
+    : null;
 
   const windows = [
     {
@@ -289,8 +323,8 @@ function computePropertyAlerts(prop, plData, alertData, todayStr) {
     {
       label:    'Days 61–90',
       startDay: 60, endDay: 90,
-      propOcc:  null, // not available from API
-      mktOcc:   null,
+      propOcc:  propOccFromBookings(bookings, prop.id, 60, 90, todayStr),
+      mktOcc:   mktOcc61_90,
     },
   ];
 
@@ -364,7 +398,7 @@ function computePropertyAlerts(prop, plData, alertData, todayStr) {
   return alerts;
 }
 
-function sectionPricingAlerts(plData, alertData, todayStr) {
+function sectionPricingAlerts(plData, alertData, bookings, todayStr) {
   let html = `<h2 style="${H2}">🚨 Pricing Alerts</h2>`;
 
   if (!PRICELABS_KEY || !alertData || !plData) {
@@ -378,7 +412,7 @@ function sectionPricingAlerts(plData, alertData, todayStr) {
   // Collect rows for ALL properties × ALL windows (not just alerting ones)
   const allRows = [];
   for (const prop of PROPERTIES) {
-    const propRows = computePropertyAlerts(prop, plData, alertData, todayStr);
+    const propRows = computePropertyAlerts(prop, plData, alertData, bookings, todayStr);
     propRows.forEach(a => allRows.push({ prop, ...a }));
   }
 
@@ -945,7 +979,7 @@ async function main() {
     sectionActivity(activity),
     sectionOpenNights(bookings, todayStr, taxRates),
     sectionPrices(bookings, plData, todayStr),
-    sectionPricingAlerts(plData, alertData, todayStr),
+    sectionPricingAlerts(plData, alertData, bookings, todayStr),
   ];
 
   const html = buildEmail(todayStr, sections);

@@ -341,13 +341,13 @@ function computePropertyAlerts(prop, plData, alertData, todayStr) {
     if (!level) {
       action = '✓ Within normal range';
     } else if (level === 'RED' && reason === 'overpriced') {
-      action = `Review and reduce pricing for ${win.label}. Currently ${ptsAbove}% above market median.`;
+      action = `Reduce pricing now — ${ptsAbove}% above market median with occupancy lagging. Drop base price in PriceLabs before the booking window closes.`;
     } else if (level === 'RED' && reason === 'occupancy_gap') {
-      action = 'Pricing may not be the issue — check listing rank and reviews on Airbnb/VRBO.';
+      action = 'Pricing is in line with market — check listing rank, photos, and reviews on Airbnb/VRBO. Low visibility may be the cause.';
     } else if (reason === 'overpriced') {
-      action = `Monitor — ${nightsAboveP75} of ${datesWithPrice.length} nights above 75th percentile.`;
+      action = `Reduce prices in PriceLabs for this window — ${nightsAboveP75} of ${datesWithPrice.length} nights above p75. Act before the booking window closes.`;
     } else {
-      action = `Monitor — avg price ${ptsAbove}% above market median.`;
+      action = `Reduce base price in PriceLabs — avg price ${ptsAbove}% above market median. Adjust now to attract advance bookings.`;
     }
 
     alerts.push({

@@ -41,6 +41,28 @@ function lastDowOfMonth(year, month, dow) {
   return new Date(Date.UTC(year, month - 1, lastDay.getUTCDate() - daysBack));
 }
 
+// Gulf Coast Jam: first Thursday on or after May 28 each year
+// (Frank Brown Park, Panama City Beach — late May, 4-day country festival)
+// Pattern verified: 2024 May 30–Jun 2, 2025 May 29–Jun 1, 2026 May 28–31
+function gulfCoastJamDates(year) {
+  const may28 = new Date(Date.UTC(year, 4, 28)); // month 4 = May (0-indexed)
+  const dow = may28.getUTCDay(); // 0=Sun … 4=Thu … 6=Sat
+  const daysToThu = (4 - dow + 7) % 7; // 0 if already Thursday
+  const thu = new Date(Date.UTC(year, 4, 28 + daysToThu));
+  const start = isoDate(thu);
+  return {
+    id: `gulf-coast-jam-${year}`,
+    name: 'Gulf Coast Jam (Country Music)',
+    market: MARKETS.PCB,
+    start_date: start,
+    end_date: addDaysToStr(start, 3),
+    impact: 'high',
+    is_watch: false,
+    source: 'hardcoded',
+    notes: 'Computed: first Thursday on or after May 28. Verify at gulfcoastjam.com.',
+  };
+}
+
 // Thunder Beach runs last Thursday–Sunday of April (spring) and October (fall)
 function thunderBeachDates(year) {
   return [['Spring', 4], ['Fall', 10]].map(([label, month]) => {
@@ -225,9 +247,7 @@ const RECURRING = [
     market: MARKETS.PCB, ms: 5, ds: 23, me: 5, de: 26,
     impact: 'high', notes: '' },
 
-  { id_base: 'gulf-coast-jam', name: 'Gulf Coast Jam (Country Music)',
-    market: MARKETS.PCB, ms: 6, ds: 4, me: 6, de: 7,
-    impact: 'high', notes: 'Frank Brown Park. 30,000+ attendees over 4 days.' },
+  // Gulf Coast Jam moved to algorithmic computation — see gulfCoastJamDates()
 
   { id_base: 'summer-peak-pcb', name: 'Summer Peak Season — Panama City Beach',
     market: MARKETS.PCB, ms: 6, ds: 1, me: 8, de: 20,
@@ -288,6 +308,11 @@ export function getHardcodedEvents(todayStr) {
         seen.add(ev.id);
         results.push(ev);
       }
+    }
+    const gcj = gulfCoastJamDates(y);
+    if (gcj.end_date >= todayStr && gcj.start_date <= cutoff && !seen.has(gcj.id)) {
+      seen.add(gcj.id);
+      results.push(gcj);
     }
   }
 

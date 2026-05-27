@@ -1486,7 +1486,7 @@ function sectionOpenNights(bookings, todayStr, taxRates) {
   return html;
 }
 
-function sectionPrices(bookings, plData, todayStr) {
+function sectionPrices(bookings, plData, todayStr, alertData) {
   const t90 = addDays(todayStr, 90);
   let html = `<h2 id="section-prices" style="${H2}">💰 Pricing — Open Days (Next 90)</h2>`;
 
@@ -1500,6 +1500,8 @@ function sectionPrices(bookings, plData, todayStr) {
   for (const p of PROPERTIES) {
     const open = openDates(bookings, p.id, todayStr, t90);
     const propPrices = plData[p.plId] || {};
+    // Use live min price from PriceLabs settings; fall back to hardcoded value
+    const liveMinPrice = alertData?.[p.plId]?.settings?.min ?? p.minPrice;
 
     if (!open.length) {
       html += `<div style="margin-bottom:16px;">${tag(p)} <span style="color:#1a7f5a;font-size:13px;margin-left:8px;">Fully booked for the next 90 days 🎉</span></div>`;
@@ -1518,7 +1520,7 @@ function sectionPrices(bookings, plData, todayStr) {
     html += `<div style="margin-bottom:24px;">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;">
         ${tag(p)}
-        <span style="font-size:12px;color:#888;">${open.length} open days · ${p.minPrice ? `min ${fmt$(p.minPrice)}` : 'no min price'}</span>
+        <span style="font-size:12px;color:#888;">${open.length} open days · ${liveMinPrice ? `min ${fmt$(liveMinPrice)}` : 'no min price'}</span>
         ${unbookable.length ? `<span style="font-size:12px;font-weight:600;color:#e67e22;margin-left:auto;">⚠ ${unbookable.length} unbookable (min stay conflict)</span>` : ''}
         ${lowDemand.length && !unbookable.length ? `<span style="font-size:12px;color:#e67e22;margin-left:auto;">↓ ${lowDemand.length} low-demand days</span>` : ''}
       </div>`;
@@ -1540,7 +1542,7 @@ function sectionPrices(bookings, plData, todayStr) {
         const isOverride = r.user_price > 0 && r.user_price !== r.price;
         const isUnbookable = r.unbookable === 1;
         const daysOut = diffDays(todayStr, r.date);
-        const urgencyNote = pricingUrgencyNote(daysOut, r.demand_desc, r.price, p.minPrice);
+        const urgencyNote = pricingUrgencyNote(daysOut, r.demand_desc, r.price, liveMinPrice);
         const rowBg = isUnbookable ? '#fffbf3' : urgencyNote?.bg || '';
         html += `<tr style="border-bottom:1px solid #f0f0f0;background:${rowBg}">
           <td style="padding:5px 8px;">${fmtDateL(r.date)}</td>
@@ -1939,7 +1941,7 @@ async function main() {
     sectionOpenNights(bookings, todayStr, taxRates),
     sectionBookingPace(tyBookings, lyBookings, paceMonths, todayStr),
     sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData),
-    sectionPrices(bookings, plData, todayStr),
+    sectionPrices(bookings, plData, todayStr, alertData),
   ];
 
   const html = buildEmail(todayStr, sections, priorityBoardHtml);

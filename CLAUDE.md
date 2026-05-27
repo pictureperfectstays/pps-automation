@@ -132,29 +132,87 @@ body: { listings: [{ id: "471179", pms: "ownerrez", min: 105, base: 228 }] }
 ---
 
 ## What's built vs planned
+
 **Built:**
 - Supabase schema + booking sync (every 3 hours)
 - Owner Portal (Vercel, reads Supabase, tax reporting from `tax_rules` table)
 - PriceLabs + OwnerRez MCPs
 - `tax_rules` table populated for all 3 markets
-- **Daily revenue email report (Phase 1 COMPLETE)** — `daily-report/index.js`
+- **Daily revenue email report (COMPLETE)** — `daily-report/index.js`
   - Sends from `reports@mail.staypictureperfect.com` via Resend
-  - Sections: MTD revenue YoY, 24h activity, open nights + gap discount tables, PriceLabs pricing
   - Logo + Instagram icon hosted on Supabase Storage (`assets` bucket)
-  - Scheduling: GitHub Actions is the agreed approach (not yet configured — next session)
-- **Pricing Alerts section (COMPLETE)** — proactive RED/YELLOW per property × 3 windows
+  - GitHub Actions workflows created (`.github/workflows/`): `daily-report.yml` (7am AZ) + `scan-events.yml` (Mon/Thu 5am AZ)
+  - **Secrets still need adding to GitHub repo** (see below)
+- **Pricing Alerts (COMPLETE)** — proactive RED/YELLOW per property × 3 windows
   - Uses `price` field only (final channel price, not user_price/uncustomized_price)
   - Neighborhood data category = bedroom count key; Y_values for Occ is double-nested (Y_values[0][0])
   - 61-90 day market occ intentionally null (advance-booking bias makes it unreliable)
   - Actions are directive: "Reduce prices in PriceLabs..." not "Monitor..."
-
-**Phase 2 — in progress:**
-- **Booking Pace vs Last Year (NEXT)** — spec agreed, ready to build next session
-  - Use `booked_at` NOT `created_at` (created_at is Supabase insert date, useless for pace)
-  - Prorate revenue across month boundaries by nights
+- **Booking Pace vs Last Year (COMPLETE)** — 3 months, revenue + nights on books today vs same date LY
+  - Uses `booked_at` NOT `created_at`; revenue prorated across month boundaries
   - Include current month if >= 7 days remain; otherwise show next 3 full months
-  - Status = 'active', revenue field = gross_revenue
-- Revenue forecast (projected month-end based on pace + historical fill rates)
-- Smart event detection (Cardinals games, spring break, foliage) calibrated to actual historical ADR
+- **Revenue Forecast (COMPLETE)** — projected month-end per property × 3 months
+  - Fill rate = % of historically open nights (at same calendar point) that filled by month-end
+  - Uses ALL available history back to first booking per property (not just 2 years)
+  - Scenarios: Conservative 0.5×, Base 1.0×, Optimistic 1.3× fill rate
+  - Portfolio total shows partial scenarios with "excl. [PropName]" note for new/data-sparse properties
+  - Emerald Views: purchased June 2025, first booking June 26 2025 — May has no LY data (correct)
+- **Smart Event Detection (COMPLETE)** — `daily-report/events-calendar.js` + `daily-report/scan-events.js`
+  - 40+ hardcoded recurring events across all 3 markets (see events-calendar.js)
+  - Thunder Beach Rally dates computed algorithmically (last Thu–Sun of April/October)
+  - Ticketmaster Discovery API (key: `TICKETMASTER_API_KEY` in settings.json) — Mon/Thu scan
+  - ESPN API for sports: Cardinals NFL (team 22), ASU football (team 9), Tennessee football + basketball (team 2633)
+  - Events cache: `daily-report/events-cache.json` — local file, committed to repo by scan workflow
+  - Filtering: football skipped from TM (ESPN handles), MLB regular season skipped, NBA regular season skipped, music/arts require major venue or 5,000+ capacity
+  - Arena venues (Footprint Center, State Farm Stadium, Chase Field, etc.) = HIGH impact regardless of reported capacity
+  - Alert email fires immediately for HIGH/VERY-HIGH impact newly discovered events only
+  - Report table: shows hardcoded + ESPN events at all impact levels; TM events only if HIGH/VERY-HIGH
+  - 91–120 day lookahead: informational only, no ADR comparison (no PriceLabs data that far out)
+  - NEW badge on events discovered within last 7 days
+  - Historical ADR: prorated from `histActive` bookings on same dates in prior years
+- **Priority Action Board (COMPLETE)** — rule-based full-report action summary at top of email
+  - No AI API needed — pure JavaScript, always runs
+  - Aggregates ALL actionable items from every section, ranked by priority:
+    1. RED pricing alerts | 2. Cancellations (24h) | 3. Gap nights + HIGH events ≤30d
+    4. YELLOW pricing alerts | 5. HIGH events 31-60d + no booking >21d with open nights
+    6. Booking pace >20% behind LY | 7. MTD portfolio >15% behind LY
+  - Data: reuses plData, alertData, bookings, events; adds MAX(booked_at) Supabase query per property
+  - Each item has a color-coded badge, specific dollar amounts (bolded), and a "↓ Jump" anchor link
+  - All 8 section h2 tags have `id` attributes for in-email anchor navigation (Gmail desktop supported)
+  - Shows "✓ No actions needed" when all properties are on track
+  - Rendered as light-blue card (`#eef4fb`) with brand-blue left border, above all white sections
+  - `loadEnv()` now merges both `~/.claude/settings.json` AND `daily-report/settings.json`
 
-**Also planned:** GitHub Actions daily schedule, seasonal price floor automation, Owner Portal auth upgrade (magic link), Invoice/Stripe, Revenue estimator, Client onboarding
+## Current email section order
+0. Priority Action Board (AI briefing — above everything else)
+1. Month-to-Date Revenue
+2. Activity — Last 24 Hours
+3. Pricing Alerts
+4. Smart Event Detection
+5. Open Nights & Gap Opportunities
+6. Booking Pace vs Last Year
+7. Revenue Forecast
+8. Pricing — Open Days (Next 90)
+
+## GitHub Actions secrets needed (not yet added)
+Go to repo Settings → Secrets → Actions → New repository secret:
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_KEY`
+- `RESEND_API_KEY`
+- `PRICELABS_API_KEY`
+- `TICKETMASTER_API_KEY`
+- `ANTHROPIC_API_KEY`
+
+## Next sessions — work remaining
+
+**To activate Priority Action Board:** add `ANTHROPIC_API_KEY` to `~/.claude/settings.json` under `env`, and add as a GitHub Actions secret (see secrets list above).
+
+**Also needed — Owner Revenue Report**
+- Property-specific report (one per owner, showing only their property's data)
+- Owner-friendly framing — not operator jargon (no gap discount math, no PriceLabs internals)
+- Show: revenue this month + YoY, upcoming bookings, occupancy, seasonal context
+- Linked from the Owner Portal (`github.com/pictureperfectstays/picture-perfect-stays-portal`)
+- Owner Portal local clone: `C:\Users\crhan\Projects\picture-perfect-stays-portal`
+- Delivered as a page in the portal (always current), not an email
+
+**Also planned:** Seasonal price floor automation, Owner Portal auth upgrade (magic link), Invoice/Stripe, Revenue estimator, Client onboarding

@@ -1,0 +1,35 @@
+name: Daily Revenue Report
+
+on:
+  schedule:
+    # 7am AZ (MST = UTC-7, no DST)
+    - cron: '0 14 * * *'
+  workflow_dispatch:        # Allow manual trigger from GitHub UI
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: daily-report
+
+      - name: Send daily report
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          PRICELABS_API_KEY: ${{ secrets.PRICELABS_API_KEY }}
+          TICKETMASTER_API_KEY: ${{ secrets.TICKETMASTER_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: node index.js
+        working-directory: daily-report

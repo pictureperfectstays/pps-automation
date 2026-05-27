@@ -8,18 +8,22 @@ import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
+import { getHardcodedEvents, PROP_MARKET } from './events-calendar.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ─── Credentials ─────────────────────────────────────────────────────────────
 
 function loadEnv() {
   const env = { ...process.env };
-  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) {
+  // Merge both global (~/.claude/settings.json) and local (daily-report/settings.json),
+  // with local taking precedence. This way all credentials can live in one place.
+  const settingsPaths = [
+    join(homedir(), '.claude', 'settings.json'),
+    join(__dirname, 'settings.json'),
+  ];
+  for (const p of settingsPaths) {
     try {
-      const localPath = join(__dirname, 'settings.json');
-      const globalPath = join(homedir(), '.claude', 'settings.json');
-      const settingsPath = existsSync(localPath) ? localPath : globalPath;
-      const settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
+      const settings = JSON.parse(readFileSync(p, 'utf8'));
       if (settings.env) Object.assign(env, settings.env);
     } catch {}
   }
@@ -31,6 +35,7 @@ const SUPABASE_URL = ENV.SUPABASE_URL;
 const SUPABASE_KEY = ENV.SUPABASE_SERVICE_KEY;
 const RESEND_KEY = ENV.RESEND_API_KEY;
 const PRICELABS_KEY = ENV.PRICELABS_API_KEY;
+const ANTHROPIC_KEY = ENV.ANTHROPIC_API_KEY;
 const PL_DATA_FILE = ENV.PRICELABS_DATA_FILE; // fallback: load from file if set
 
 if (!SUPABASE_URL || !SUPABASE_KEY) { console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY'); process.exit(1); }
@@ -82,6 +87,47 @@ const fmtDateL = d => { const dt = new Date(d + 'T00:00:00Z'); return `${DAYS[dt
 const isoMonthStart = d => d.slice(0, 7) + '-01';
 const fmt$ = n => n == null || n < 0 ? '—' : '$' + Math.round(n).toLocaleString();
 
+// ─── Booking Pace Helpers ─────────────────────────────────────────────────────
+
+// Returns the 3 months to show in the pace section.
+// Include current month if >= 7 days remain; otherwise start from next full month.
+function getPaceMonths(todayStr) {
+  const [yr, mo, day] = todayStr.split('-').map(Number);
+  // new Date(yr, mo, 0) = last day of month `mo` (1-indexed, JS handles overflow)
+  const daysInMonth   = new Date(yr, mo, 0).getDate();
+  const daysRemaining = daysInMonth - day;
+  const monthOffset   = daysRemaining >= 7 ? 0 : 1;
+
+  return Array.from({ length: 3 }, (_, i) => {
+    const mIdx    = mo - 1 + monthOffset + i; // 0-indexed from Jan
+    const tyStart = new Date(Date.UTC(yr,     mIdx,     1));
+    const tyEnd   = new Date(Date.UTC(yr,     mIdx + 1, 1));
+    const lyStart = new Date(Date.UTC(yr - 1, mIdx,     1));
+    const lyEnd   = new Date(Date.UTC(yr - 1, mIdx + 1, 1));
+    return {
+      start:   tyStart.toISOString().slice(0, 10),
+      end:     tyEnd.toISOString().slice(0, 10),
+      lyStart: lyStart.toISOString().slice(0, 10),
+      lyEnd:   lyEnd.toISOString().slice(0, 10),
+      label:   tyStart.toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' }),
+      lyLabel: lyStart.toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' }),
+    };
+  });
+}
+
+// Prorate a booking's gross_revenue and nights into the overlap with [monthStart, monthEnd)
+function prorateToMonth(booking, monthStart, monthEnd) {
+  const arrival       = booking.arrival_date;
+  const departure     = booking.departure_date;
+  const totalNights   = booking.nights || Math.max(1, diffDays(arrival, departure));
+  const overlapStart  = arrival   < monthStart ? monthStart : arrival;
+  const overlapEnd    = departure > monthEnd   ? monthEnd   : departure;
+  const overlapNights = diffDays(overlapStart, overlapEnd);
+  if (overlapNights <= 0) return { revenue: 0, nights: 0 };
+  const frac = overlapNights / totalNights;
+  return { revenue: (Number(booking.gross_revenue) || 0) * frac, nights: overlapNights };
+}
+
 // ─── Supabase ─────────────────────────────────────────────────────────────────
 
 async function sb(path) {
@@ -132,6 +178,36 @@ async function fetchMTDRevenue(todayStr) {
   return { cur, ly, thisStart, lyStart };
 }
 
+async function fetchBookingPaceData(paceMonths, todayStr) {
+  // LY snapshot: include all of (today − 365), not just midnight
+  const lySnapshot   = addDays(todayStr, -365) + 'T23:59:59';
+  const firstTYStart = paceMonths[0].start;
+  const lastTYEnd    = paceMonths[paceMonths.length - 1].end;
+  const firstLYStart = paceMonths[0].lyStart;
+  const lastLYEnd    = paceMonths[paceMonths.length - 1].lyEnd;
+  const [tyBookings, lyBookings] = await Promise.all([
+    sb(`bookings?select=property_id,arrival_date,departure_date,nights,gross_revenue&status=eq.active&arrival_date=lt.${lastTYEnd}&departure_date=gt.${firstTYStart}&order=arrival_date.asc`),
+    sb(`bookings?select=property_id,arrival_date,departure_date,nights,gross_revenue&status=eq.active&booked_at=lte.${lySnapshot}&arrival_date=lt.${lastLYEnd}&departure_date=gt.${firstLYStart}&order=arrival_date.asc`),
+  ]);
+  return { tyBookings, lyBookings };
+}
+
+async function fetchRevenueForecastData(paceMonths, todayStr) {
+  const firstStart       = paceMonths[0].start;
+  const lastEnd          = paceMonths[paceMonths.length - 1].end;
+  const currentYearStart = `${todayStr.slice(0, 4)}-01-01`;
+
+  // Fetch in parallel: current-year blocks for forecast months + all historical active/blocked
+  const [tyBlocked, histPage1, histPage2, histBlocked] = await Promise.all([
+    sb(`bookings?select=property_id,arrival_date,departure_date&status=eq.blocked&arrival_date=lt.${lastEnd}&departure_date=gt.${firstStart}&order=arrival_date.asc`),
+    sb(`bookings?select=property_id,arrival_date,departure_date,gross_revenue,booked_at&status=eq.active&arrival_date=lt.${currentYearStart}&order=arrival_date.asc&limit=1000&offset=0`),
+    sb(`bookings?select=property_id,arrival_date,departure_date,gross_revenue,booked_at&status=eq.active&arrival_date=lt.${currentYearStart}&order=arrival_date.asc&limit=1000&offset=1000`),
+    sb(`bookings?select=property_id,arrival_date,departure_date&status=eq.blocked&arrival_date=lt.${currentYearStart}&order=arrival_date.asc`),
+  ]);
+
+  return { tyBlocked, histActive: [...histPage1, ...histPage2], histBlocked };
+}
+
 // ─── Tax Rules ────────────────────────────────────────────────────────────────
 
 async function fetchTaxRates() {
@@ -142,6 +218,63 @@ async function fetchTaxRates() {
     totals[row.property_id] = (totals[row.property_id] || 0) + Number(row.rate) / 100;
   }
   return totals;
+}
+
+// ─── Events Cache ─────────────────────────────────────────────────────────────
+
+function fetchEventsCache() {
+  try {
+    const cachePath = join(__dirname, 'events-cache.json');
+    if (!existsSync(cachePath)) return [];
+    const data = JSON.parse(readFileSync(cachePath, 'utf8'));
+    return data.events || [];
+  } catch {
+    return [];
+  }
+}
+
+// Compute historical ADR for an event's date window from histActive bookings.
+// Uses proration — counts only nights and revenue within the event dates.
+// Returns { adr, nights, years } or null if insufficient data.
+function computeEventADR(event, histActive, propId) {
+  const currentYear = parseInt(today().slice(0, 4));
+  const eventMonth  = event.start_date.slice(5, 7); // MM
+  const eventDay    = event.start_date.slice(8, 10); // DD
+  const eventMonthE = event.end_date.slice(5, 7);
+  const eventDayE   = event.end_date.slice(8, 10);
+
+  const propBookings = histActive.filter(b => b.property_id === propId);
+  if (!propBookings.length) return null;
+
+  const earliest = Math.min(...propBookings.map(b => parseInt(b.arrival_date.slice(0, 4))));
+  const byYear   = {};
+
+  for (let yr = earliest; yr < currentYear; yr++) {
+    // Build the event window for this historical year, accounting for cross-year events
+    const evStart = `${yr}-${eventMonth}-${eventDay}`;
+    const endYear = event.end_date.slice(5, 7) < event.start_date.slice(5, 7) ? yr + 1 : yr;
+    const evEnd   = addDays(`${endYear}-${eventMonthE}-${eventDayE}`, 1); // exclusive end
+
+    let revenue = 0;
+    let nights  = 0;
+    for (const b of propBookings) {
+      const { revenue: r, nights: n } = prorateToMonth(
+        b,
+        evStart,
+        evEnd,
+      );
+      revenue += r;
+      nights  += n;
+    }
+    if (nights > 0) byYear[yr] = { revenue, nights };
+  }
+
+  const years = Object.keys(byYear).length;
+  if (!years) return null;
+
+  const totalRevenue = Object.values(byYear).reduce((s, v) => s + v.revenue, 0);
+  const totalNights  = Object.values(byYear).reduce((s, v) => s + v.nights, 0);
+  return { adr: totalRevenue / totalNights, nights: totalNights, years };
 }
 
 // ─── PriceLabs Data (supplied externally by CoWork routine) ───────────────────
@@ -404,7 +537,7 @@ function computePropertyAlerts(prop, plData, alertData, bookings, todayStr) {
 }
 
 function sectionPricingAlerts(plData, alertData, bookings, todayStr) {
-  let html = `<h2 style="${H2}">🚨 Pricing Alerts</h2>`;
+  let html = `<h2 id="section-pricing" style="${H2}">🚨 Pricing Alerts</h2>`;
 
   if (!PRICELABS_KEY || !alertData || !plData) {
     return html + `<p style="color:#888;font-style:italic;font-size:13px;">PriceLabs data required for pricing alerts.</p>`;
@@ -574,6 +707,161 @@ function revenueByProp(rows) {
   return r;
 }
 
+// ─── Revenue Forecast ────────────────────────────────────────────────────────
+
+function computeLYActual(prop, paceMonth, histActive) {
+  let revenue = 0;
+  for (const b of histActive) {
+    if (b.property_id !== prop.id) continue;
+    revenue += prorateToMonth(b, paceMonth.lyStart, paceMonth.lyEnd).revenue;
+  }
+  return revenue;
+}
+
+// Core fill-rate + projection engine for one property × one forecast month.
+function computePropertyForecast(prop, paceMonth, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData) {
+  const currentYear = parseInt(todayStr.slice(0, 4));
+  const monthNum    = parseInt(paceMonth.start.split('-')[1]);
+  const todayDay    = parseInt(todayStr.split('-')[2]);
+  const daysInMonth = diffDays(paceMonth.start, paceMonth.end);
+
+  // Build date sets for confirmed bookings and blocks within this month
+  const confirmedDates = new Set();
+  const blockedDates   = new Set();
+
+  const addDatesToSet = (bookings, set) => {
+    for (const b of bookings) {
+      if (b.property_id !== prop.id) continue;
+      let d = b.arrival_date < paceMonth.start ? paceMonth.start : b.arrival_date;
+      while (d < b.departure_date && d < paceMonth.end) { set.add(d); d = addDays(d, 1); }
+    }
+  };
+  addDatesToSet(tyBookings, confirmedDates);
+  addDatesToSet(tyBlocked,  blockedDates);
+
+  // Confirmed revenue (prorated across month boundaries)
+  let confirmedRevenue = 0;
+  for (const b of tyBookings) {
+    if (b.property_id !== prop.id) continue;
+    confirmedRevenue += prorateToMonth(b, paceMonth.start, paceMonth.end).revenue;
+  }
+  const confirmedNights = confirmedDates.size;
+  const blockedNights   = blockedDates.size;
+  const availableDays   = daysInMonth - blockedNights;
+
+  // Open nights remaining: from today for current month; full month for future months
+  const openStart = paceMonth.start >= todayStr ? paceMonth.start : todayStr;
+  const openDates = [];
+  let d = openStart;
+  while (d < paceMonth.end) {
+    if (!confirmedDates.has(d) && !blockedDates.has(d)) openDates.push(d);
+    d = addDays(d, 1);
+  }
+  const openNights = openDates.length;
+
+  // Historical fill rate — use ALL available prior years back to first booking
+  const propHistActive  = histActive.filter(b => b.property_id === prop.id);
+  const propHistBlocked = histBlocked.filter(b => b.property_id === prop.id);
+
+  const earliestYear = propHistActive.length > 0
+    ? Math.min(...propHistActive.map(b => parseInt(b.arrival_date.slice(0, 4))))
+    : currentYear - 1;
+
+  const fillRates        = [];
+  const fullyBookedYears = [];
+  const lyMonthStr       = String(monthNum).padStart(2, '0');
+
+  for (let yr = currentYear - 1; yr >= earliestYear; yr--) {
+    const lyStart = `${yr}-${lyMonthStr}-01`;
+    const lyEnd   = new Date(Date.UTC(yr, monthNum, 1)).toISOString().slice(0, 10);
+    const lyDays  = diffDays(lyStart, lyEnd);
+
+    // Clamp same-day to handle shorter months (e.g., forecasting Mar when today is Jan 31)
+    const sameDay   = Math.min(todayDay, lyDays);
+    const samePoint = `${yr}-${lyMonthStr}-${String(sameDay).padStart(2, '0')}`;
+
+    // Historical blocked dates in this month
+    const lyBlockedDates = new Set();
+    for (const b of propHistBlocked) {
+      if (b.arrival_date >= lyEnd || b.departure_date <= lyStart) continue;
+      let dt = b.arrival_date < lyStart ? lyStart : b.arrival_date;
+      while (dt < b.departure_date && dt < lyEnd) { lyBlockedDates.add(dt); dt = addDays(dt, 1); }
+    }
+    const lyAvailable = lyDays - lyBlockedDates.size;
+
+    const lyMonthBookings = propHistActive.filter(b => b.arrival_date >= lyStart && b.arrival_date < lyEnd);
+    if (lyMonthBookings.length === 0) continue; // No data for this property in this year/month
+
+    // Nights confirmed at same calendar point
+    const lyAtPointDates = new Set();
+    for (const b of lyMonthBookings) {
+      if (!b.booked_at || b.booked_at.slice(0, 10) > samePoint) continue;
+      let dt = b.arrival_date < lyStart ? lyStart : b.arrival_date;
+      while (dt < b.departure_date && dt < lyEnd) { lyAtPointDates.add(dt); dt = addDays(dt, 1); }
+    }
+
+    // Total nights confirmed by month-end
+    const lyTotalDates = new Set();
+    for (const b of lyMonthBookings) {
+      let dt = b.arrival_date < lyStart ? lyStart : b.arrival_date;
+      while (dt < b.departure_date && dt < lyEnd) { lyTotalDates.add(dt); dt = addDays(dt, 1); }
+    }
+
+    const lyOpenAtPoint = Math.max(0, lyAvailable - lyAtPointDates.size);
+
+    if (lyOpenAtPoint === 0) {
+      fullyBookedYears.push(yr);
+      continue;
+    }
+
+    const lyFilled  = Math.max(0, lyTotalDates.size - lyAtPointDates.size);
+    const fillRate  = Math.min(1.0, lyFilled / lyOpenAtPoint);
+    fillRates.push({ yr, fillRate, openAtPoint: lyOpenAtPoint, filled: lyFilled });
+  }
+
+  // LY actual revenue (no booked_at filter — final month-end result)
+  const lyActualRevenue = computeLYActual(prop, paceMonth, histActive);
+
+  if (fillRates.length === 0 && openNights > 0) {
+    return {
+      prop, paceMonth, confirmedRevenue, confirmedNights, openNights, availableDays,
+      fillRates: [], fullyBookedYears, lyActualRevenue,
+      conservative: null, base: null, optimistic: null, isRedFlag: false, isFullyBooked: false,
+      error: 'no_fill_rate_data',
+    };
+  }
+
+  const avgFillRate = fillRates.length > 0
+    ? fillRates.reduce((s, r) => s + r.fillRate, 0) / fillRates.length
+    : 0;
+
+  // Average PriceLabs price across remaining open nights that have price data
+  const propPrices      = plData?.[prop.plId] || {};
+  const pricedOpenDates = openDates.filter(d => propPrices[d]?.price > 0);
+  const avgPrice        = pricedOpenDates.length > 0
+    ? pricedOpenDates.reduce((s, d) => s + propPrices[d].price, 0) / pricedOpenDates.length
+    : null;
+
+  const scenario = (mult) => {
+    if (openNights === 0) return confirmedRevenue; // Fully booked — confirmed is the projection
+    if (avgPrice == null) return null;             // Can't project without prices
+    return confirmedRevenue + openNights * Math.min(1.0, avgFillRate * mult) * avgPrice;
+  };
+
+  const conservative  = scenario(0.5);
+  const base          = scenario(1.0);
+  const optimistic    = scenario(1.3);
+  const isFullyBooked = openNights === 0;
+  const isRedFlag     = base != null && lyActualRevenue > 0 && base < lyActualRevenue * 0.85;
+
+  return {
+    prop, paceMonth, confirmedRevenue, confirmedNights, openNights, availableDays,
+    avgFillRate, avgPrice, fillRates, fullyBookedYears,
+    conservative, base, optimistic, lyActualRevenue,
+    isFullyBooked, isRedFlag,
+  };
+}
+
 // ─── Pricing Intelligence ────────────────────────────────────────────────────
 
 // Returns an urgency note object {text, color, bg} for a given open date, or null if no action needed.
@@ -653,7 +941,7 @@ function sectionMTD(mtd, todayStr) {
     <td style="padding:8px 12px;"></td>
   </tr>`;
 
-  return `<h2 style="${H2}">📊 Month-to-Date Revenue — ${monthLabel}</h2>
+  return `<h2 id="section-mtd" style="${H2}">📊 Month-to-Date Revenue — ${monthLabel}</h2>
   <table style="width:100%;border-collapse:collapse;font-size:13px;">
     <tr style="background:#f8f9fa;">
       <th style="${TH}">Property</th><th style="${TH}text-align:right;">This Month</th>
@@ -664,12 +952,449 @@ function sectionMTD(mtd, todayStr) {
   <p style="font-size:11px;color:#aaa;margin:8px 0 0;">Bookings with arrival date in ${monthLabel} through ${fmtDate(todayStr)}. Prior year = same ${Math.round(diffDays(mtd.lyStart, addDays(todayStr,-365))+1)}-day window.</p>`;
 }
 
+function sectionBookingPace(tyBookings, lyBookings, paceMonths, todayStr) {
+  const lySnapshotLabel = fmtDate(addDays(todayStr, -365));
+  let html = `<h2 id="section-pace" style="${H2}">📈 Booking Pace vs Last Year</h2>`;
+  html += `<p style="font-size:12px;color:#888;margin:0 0 16px;">Revenue on the books for each upcoming month — today vs. same date last year (${lySnapshotLabel}).</p>`;
+
+  for (const month of paceMonths) {
+    const ty = {}, ly = {};
+    for (const p of PROPERTIES) {
+      ty[p.id] = { revenue: 0, nights: 0 };
+      ly[p.id] = { revenue: 0, nights: 0 };
+    }
+    for (const b of tyBookings) {
+      if (!ty[b.property_id]) continue;
+      const { revenue, nights } = prorateToMonth(b, month.start, month.end);
+      ty[b.property_id].revenue += revenue;
+      ty[b.property_id].nights  += nights;
+    }
+    for (const b of lyBookings) {
+      if (!ly[b.property_id]) continue;
+      const { revenue, nights } = prorateToMonth(b, month.lyStart, month.lyEnd);
+      ly[b.property_id].revenue += revenue;
+      ly[b.property_id].nights  += nights;
+    }
+
+    let rows = '';
+    let totTYRev = 0, totLYRev = 0, totTYNts = 0, totLYNts = 0;
+    for (const p of PROPERTIES) {
+      const tyRev = ty[p.id].revenue, lyRev = ly[p.id].revenue;
+      const tyNts = ty[p.id].nights,  lyNts = ly[p.id].nights;
+      totTYRev += tyRev; totLYRev += lyRev; totTYNts += tyNts; totLYNts += lyNts;
+      const yoy      = lyRev > 0 ? (tyRev - lyRev) / lyRev * 100 : null;
+      const yoyStr   = yoy != null ? `${yoy >= 0 ? '+' : ''}${Math.round(yoy)}%` : '—';
+      const yoyColor = yoy == null ? '#999' : yoy >= 5 ? '#1a7f5a' : yoy < -5 ? '#c0392b' : '#e67e22';
+      rows += `<tr>
+        <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;">${tag(p)}</td>
+        <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;font-weight:600;">${fmt$(Math.round(tyRev))}</td>
+        <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;color:#666;">${fmt$(Math.round(lyRev))}</td>
+        <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;font-weight:600;color:${yoyColor};">${yoyStr}</td>
+        <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;color:#888;font-size:12px;">${Math.round(tyNts)}n / ${Math.round(lyNts)}n</td>
+      </tr>`;
+    }
+    const totYoY    = totLYRev > 0 ? (totTYRev - totLYRev) / totLYRev * 100 : null;
+    const totYoYStr = totYoY != null ? `${totYoY >= 0 ? '+' : ''}${Math.round(totYoY)}%` : '—';
+    const totColor  = totYoY == null ? '#999' : totYoY >= 5 ? '#1a7f5a' : totYoY < -5 ? '#c0392b' : '#e67e22';
+    rows += `<tr style="background:#f8f9fa;">
+      <td style="padding:7px 12px;font-weight:700;">Portfolio Total</td>
+      <td style="padding:7px 12px;text-align:right;font-weight:700;">${fmt$(Math.round(totTYRev))}</td>
+      <td style="padding:7px 12px;text-align:right;color:#666;">${fmt$(Math.round(totLYRev))}</td>
+      <td style="padding:7px 12px;text-align:right;font-weight:700;color:${totColor};">${totYoYStr}</td>
+      <td style="padding:7px 12px;text-align:right;color:#888;font-size:12px;">${Math.round(totTYNts)}n / ${Math.round(totLYNts)}n</td>
+    </tr>`;
+
+    html += `<div style="margin-bottom:20px;">
+      <div style="font-size:13px;font-weight:700;color:#444;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid #eee;">
+        ${month.label}
+        <span style="font-size:11px;font-weight:400;color:#aaa;margin-left:8px;">vs ${month.lyLabel}</span>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:13px;">
+        <tr style="background:#f8f9fa;">
+          <th style="${TH}">Property</th>
+          <th style="${TH}text-align:right;">Booked TY</th>
+          <th style="${TH}text-align:right;">Booked LY</th>
+          <th style="${TH}text-align:right;">YoY</th>
+          <th style="${TH}text-align:right;">Nights TY/LY</th>
+        </tr>${rows}
+      </table>
+    </div>`;
+  }
+
+  return html;
+}
+
+function sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData) {
+  let html = `<h2 id="section-forecast" style="${H2}">🔮 Revenue Forecast</h2>`;
+  html += `<p style="font-size:12px;color:#888;margin:0 0 16px;">Projected month-end revenue: confirmed bookings + expected fill of remaining open nights based on historical patterns.</p>`;
+
+  for (const month of paceMonths) {
+    const forecasts = PROPERTIES.map(prop =>
+      computePropertyForecast(prop, month, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData)
+    );
+
+    let totConfirmed = 0, totConservative = 0, totBase = 0, totOptimistic = 0, totLY = 0;
+    const excludedFromScenarios = [];
+
+    let rows = '';
+    for (const f of forecasts) {
+      totConfirmed += f.confirmedRevenue;
+      totLY        += f.lyActualRevenue;
+
+      const rowBg = f.isRedFlag ? '#fff5f5' : '#fff';
+
+      // Fill rate cell
+      let fillRateCell;
+      if (f.isFullyBooked) {
+        fillRateCell = `<td style="padding:7px 10px;text-align:right;color:#1a7f5a;font-size:11px;">Fully booked</td>`;
+      } else if (f.fillRates.length === 0) {
+        fillRateCell = `<td style="padding:7px 10px;text-align:right;color:#aaa;">—</td>`;
+      } else {
+        const pct  = Math.round(f.avgFillRate * 100);
+        const yrs  = f.fillRates.length;
+        fillRateCell = `<td style="padding:7px 10px;text-align:right;">${pct}%
+          <div style="font-size:10px;color:#aaa;">n=${yrs} yr${yrs !== 1 ? 's' : ''}</div></td>`;
+      }
+
+      // Scenario cells
+      let scenarioCells;
+      if (f.isFullyBooked) {
+        const v = fmt$(Math.round(f.confirmedRevenue));
+        scenarioCells = `
+          <td style="padding:7px 10px;text-align:right;color:#888;">${v}</td>
+          <td style="padding:7px 10px;text-align:right;font-weight:700;color:#1a7f5a;">${v}</td>
+          <td style="padding:7px 10px;text-align:right;color:#888;">${v}</td>`;
+        totConservative += f.confirmedRevenue;
+        totBase         += f.confirmedRevenue;
+        totOptimistic   += f.confirmedRevenue;
+      } else if (f.conservative == null) {
+        excludedFromScenarios.push(f.prop.name);
+        const msg = f.error === 'no_fill_rate_data'
+          ? 'Insufficient history'
+          : plData ? 'No price data' : 'PriceLabs unavailable';
+        scenarioCells = `<td colspan="3" style="padding:7px 10px;text-align:center;color:#aaa;font-size:11px;">${msg}</td>`;
+      } else {
+        totConservative += f.conservative;
+        totBase         += f.base;
+        totOptimistic   += f.optimistic;
+        const baseColor  = f.isRedFlag ? '#c0392b' : '#1a7f5a';
+        scenarioCells = `
+          <td style="padding:7px 10px;text-align:right;color:#888;">${fmt$(Math.round(f.conservative))}</td>
+          <td style="padding:7px 10px;text-align:right;font-weight:700;color:${baseColor};">${fmt$(Math.round(f.base))}</td>
+          <td style="padding:7px 10px;text-align:right;color:#888;">${fmt$(Math.round(f.optimistic))}</td>`;
+      }
+
+      // Open nights cell — show avg PL price as subtext
+      const openNtsCell = f.isFullyBooked
+        ? `<td style="padding:7px 10px;text-align:right;color:#1a7f5a;">0</td>`
+        : `<td style="padding:7px 10px;text-align:right;">${f.openNights}${f.avgPrice ? `<div style="font-size:10px;color:#aaa;">avg ${fmt$(Math.round(f.avgPrice))}/nt</div>` : ''}</td>`;
+
+      const lyColor = f.isRedFlag ? '#c0392b' : '#666';
+      rows += `<tr style="background:${rowBg};border-bottom:1px solid #f0f0f0;">
+        <td style="padding:7px 10px;">${badge(f.prop.name, f.prop.color)}</td>
+        <td style="padding:7px 10px;text-align:right;font-weight:600;">${fmt$(Math.round(f.confirmedRevenue))}
+          <div style="font-size:10px;color:#aaa;font-weight:400;">${f.confirmedNights} nts</div></td>
+        ${openNtsCell}
+        ${fillRateCell}
+        ${scenarioCells}
+        <td style="padding:7px 10px;text-align:right;color:${lyColor};">${fmt$(Math.round(f.lyActualRevenue))}</td>
+      </tr>`;
+
+      // Footnote row for years where property was fully booked at this point
+      if (f.fullyBookedYears.length > 0) {
+        rows += `<tr style="background:${rowBg};">
+          <td colspan="8" style="padding:1px 10px 6px 30px;font-size:10px;color:#aaa;">
+            Fully booked at this calendar point in ${f.fullyBookedYears.join(', ')} — excluded from fill rate average
+          </td>
+        </tr>`;
+      }
+    }
+
+    // Portfolio total row — show partial scenarios with exclusion note if some properties lack data
+    const totBaseColor = (totBase > 0 && totLY > 0 && totBase < totLY * 0.85) ? '#c0392b' : '#333';
+    const allExcluded  = excludedFromScenarios.length === PROPERTIES.length;
+    const someExcluded = excludedFromScenarios.length > 0 && !allExcluded;
+    const exclNote     = someExcluded
+      ? `<div style="font-size:10px;color:#aaa;font-weight:400;">excl. ${excludedFromScenarios.join(', ')}</div>`
+      : '';
+    const totScenarioCells = allExcluded
+      ? `<td colspan="3" style="padding:7px 12px;"></td>`
+      : `<td style="padding:7px 12px;text-align:right;color:#888;">${fmt$(Math.round(totConservative))}${exclNote}</td>
+         <td style="padding:7px 12px;text-align:right;font-weight:700;color:${totBaseColor};">${fmt$(Math.round(totBase))}${exclNote}</td>
+         <td style="padding:7px 12px;text-align:right;color:#888;">${fmt$(Math.round(totOptimistic))}${exclNote}</td>`;
+
+    rows += `<tr style="background:#f8f9fa;">
+      <td style="padding:7px 12px;font-weight:700;">Portfolio Total</td>
+      <td style="padding:7px 12px;text-align:right;font-weight:700;">${fmt$(Math.round(totConfirmed))}</td>
+      <td style="padding:7px 12px;"></td>
+      <td style="padding:7px 12px;"></td>
+      ${totScenarioCells}
+      <td style="padding:7px 12px;text-align:right;font-weight:700;color:#666;">${fmt$(Math.round(totLY))}</td>
+    </tr>`;
+
+    html += `<div style="margin-bottom:20px;">
+      <div style="font-size:13px;font-weight:700;color:#444;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid #eee;">
+        ${month.label}
+        <span style="font-size:11px;font-weight:400;color:#aaa;margin-left:8px;">vs ${month.lyLabel} actual</span>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <tr style="background:#f8f9fa;">
+          <th style="${TH}">Property</th>
+          <th style="${TH}text-align:right;">Confirmed</th>
+          <th style="${TH}text-align:right;">Open Nts</th>
+          <th style="${TH}text-align:right;">Fill Rate</th>
+          <th style="${TH}text-align:right;color:#888;">Conservative</th>
+          <th style="${TH}text-align:right;color:#1a7f5a;">Base</th>
+          <th style="${TH}text-align:right;color:#888;">Optimistic</th>
+          <th style="${TH}text-align:right;">LY Actual</th>
+        </tr>${rows}
+      </table>
+    </div>`;
+  }
+
+  html += `<p style="font-size:11px;color:#aaa;margin:8px 0 0;">
+    Revenue prorated for bookings spanning month boundaries. Fill rate = % of open nights at this same calendar date historically that were booked by month-end, averaged across all available prior years.
+    Scenarios: Conservative = 50% of fill rate · Base = 100% · Optimistic = 130%.
+    <span style="display:inline-block;background:#fff5f5;color:#c0392b;padding:1px 5px;border-radius:3px;margin-top:2px;">Red row</span> = base projection &gt;15% below last year's actual.
+  </p>`;
+
+  return html;
+}
+
+// ─── Smart Event Detection ────────────────────────────────────────────────────
+
+const IMPACT_ORDER = { 'very-high': 4, 'high': 3, 'moderate': 2, 'low-moderate': 1, 'watch': 0 };
+const IMPACT_COLOR = {
+  'very-high':    '#7b2d8b',
+  'high':         '#2980b9',
+  'moderate':     '#1a7f5a',
+  'low-moderate': '#888',
+  'watch':        '#d97706',
+};
+const IMPACT_LABEL = {
+  'very-high':    'Very High',
+  'high':         'High',
+  'moderate':     'Moderate',
+  'low-moderate': 'Low-Mod',
+  'watch':        '⚠ Watch',
+};
+
+function sectionSmartEvents(hardcodedEvents, cachedEvents, plData, histActive, todayStr) {
+  let html = `<h2 id="section-events" style="${H2}">📍 Smart Event Detection</h2>`;
+
+  const cutoff90  = addDays(todayStr, 90);
+  const cutoff120 = addDays(todayStr, 120);
+
+  // Merge hardcoded + cached (Ticketmaster/ESPN), dedup by id
+  const allByKey = new Map();
+  for (const ev of [...hardcodedEvents, ...cachedEvents]) {
+    if (!allByKey.has(ev.id)) allByKey.set(ev.id, ev);
+  }
+
+  // Filter to events overlapping [today, today+120] and split into windows.
+  // For Ticketmaster events, only surface high/very-high impact in the main table
+  // to avoid noise from hundreds of moderate concerts and regular-season games.
+  const upcoming  = []; // next 90 days — full ADR analysis
+  const lookahead = []; // 91–120 days — informational only
+  let tmModerateCount = 0;
+
+  for (const ev of allByKey.values()) {
+    if (ev.end_date < todayStr) continue;
+    if (ev.start_date > cutoff120) continue;
+
+    // Ticketmaster moderate events: count but don't surface in tables
+    if (ev.source === 'ticketmaster' && ev.impact !== 'high' && ev.impact !== 'very-high') {
+      tmModerateCount++;
+      continue;
+    }
+
+    if (ev.start_date <= cutoff90 || ev.end_date <= cutoff90) {
+      upcoming.push(ev);
+    } else {
+      lookahead.push(ev);
+    }
+  }
+
+  upcoming.sort((a, b) => a.start_date.localeCompare(b.start_date));
+  lookahead.sort((a, b) => a.start_date.localeCompare(b.start_date));
+
+  if (!upcoming.length && !lookahead.length) {
+    return html + `<p style="color:#888;font-size:13px;font-style:italic;">No major events detected in the next 120 days.</p>`;
+  }
+
+  const sevenDaysAgo = addDays(todayStr, -7);
+  const WATCH_BG  = '#fffbf0';
+  const WATCH_CLR = '#d97706';
+  const RED_BG    = '#fff0f0';
+  const RED_CLR   = '#c0392b';
+  const AMB_BG    = '#fffbf0';
+  const AMB_CLR   = '#d97706';
+  const GRN_CLR   = '#1a7f5a';
+  const GRY_CLR   = '#888';
+
+  // Build rows for the 0–90 day table
+  const tableRows = [];
+
+  for (const ev of upcoming) {
+    // Which properties are affected by this market?
+    const affectedProps = PROPERTIES.filter(p => PROP_MARKET[p.id] === ev.market);
+
+    for (const prop of affectedProps) {
+      const dateRange = ev.start_date === ev.end_date
+        ? fmtDate(ev.start_date)
+        : `${fmtDate(ev.start_date)} – ${fmtDate(ev.end_date)}`;
+
+      const isNew = ev.discovered_at && ev.discovered_at.slice(0, 10) >= sevenDaysAgo;
+
+      // Historical ADR
+      const hist = computeEventADR(ev, histActive, prop.id);
+
+      // Current PriceLabs avg price over these dates
+      let currentAvgPrice = null;
+      if (plData?.[prop.plId]) {
+        const prices = plData[prop.plId];
+        const pricedDates = [];
+        let d = ev.start_date;
+        while (d <= ev.end_date && d <= cutoff90) {
+          if (prices[d]?.price > 0) pricedDates.push(prices[d].price);
+          d = addDays(d, 1);
+        }
+        if (pricedDates.length) {
+          currentAvgPrice = pricedDates.reduce((s, v) => s + v, 0) / pricedDates.length;
+        }
+      }
+
+      // Alert logic
+      let alertLevel = null; // 'red' | 'amber' | 'green' | 'info'
+      let alertText  = '';
+
+      if (ev.is_watch) {
+        // Slow season: flag if current price is >20% above historical ADR
+        if (hist && currentAvgPrice && currentAvgPrice > hist.adr * 1.20) {
+          const pctAbove = Math.round((currentAvgPrice / hist.adr - 1) * 100);
+          alertLevel = 'amber';
+          alertText  = `Pricing ${pctAbove}% above historical ADR for this slow period. Reduce to attract bookings.`;
+        } else if (hist && currentAvgPrice) {
+          alertLevel = 'green';
+          alertText  = 'Pricing within historical range for slow season. ✓';
+        } else {
+          alertLevel = 'info';
+          alertText  = 'Watch period — price at or below market median.';
+        }
+      } else if (!hist) {
+        alertLevel = 'info';
+        alertText  = 'No prior-year data — first occurrence or insufficient history. Monitor closely.';
+      } else if (currentAvgPrice && currentAvgPrice < hist.adr * 0.90) {
+        const pctBelow = Math.round((1 - currentAvgPrice / hist.adr) * 100);
+        alertLevel = 'red';
+        alertText  = `Potentially underpriced by ${pctBelow}%. Historical ADR was ${fmt$(Math.round(hist.adr))} — consider raising prices in PriceLabs before guests find this gap.`;
+      } else if (currentAvgPrice && currentAvgPrice >= hist.adr * 0.90) {
+        alertLevel = 'green';
+        alertText  = 'Pricing in line with historical performance. ✓';
+      } else {
+        alertLevel = 'info';
+        alertText  = hist ? `Historical ADR: ${fmt$(Math.round(hist.adr))}. No PriceLabs price data for these dates yet.` : '';
+      }
+
+      const rowBg = ev.is_watch ? WATCH_BG : alertLevel === 'red' ? RED_BG : alertLevel === 'amber' ? AMB_BG : '#fff';
+      const alertColor = ev.is_watch ? WATCH_CLR : alertLevel === 'red' ? RED_CLR : alertLevel === 'amber' ? AMB_CLR : alertLevel === 'green' ? GRN_CLR : GRY_CLR;
+      const alertBadge = alertLevel === 'red' ? '🔴' : alertLevel === 'amber' ? '🟡' : alertLevel === 'green' ? '✓' : 'ℹ';
+      const impColor = IMPACT_COLOR[ev.impact] || '#888';
+      const histCell = hist
+        ? `${fmt$(Math.round(hist.adr))}<div style="font-size:10px;color:#aaa;">n=${hist.years} yr${hist.years!==1?'s':''}</div>`
+        : `<span style="color:#aaa;">—</span>`;
+      const plCell = currentAvgPrice ? fmt$(Math.round(currentAvgPrice)) : `<span style="color:#aaa;">—</span>`;
+      const gapCell = hist && currentAvgPrice
+        ? (() => {
+            const pct = Math.round((currentAvgPrice / hist.adr - 1) * 100);
+            const c   = pct > 10 ? GRN_CLR : pct < -10 ? RED_CLR : '#666';
+            return `<span style="color:${c};font-weight:${Math.abs(pct)>10?'700':'400'};">${pct>0?'+':''}${pct}%</span>`;
+          })()
+        : `<span style="color:#aaa;">—</span>`;
+
+      tableRows.push({ rowBg, ev, prop, dateRange, isNew, impColor, histCell, plCell, gapCell, alertColor, alertBadge, alertText });
+    }
+  }
+
+  if (tableRows.length) {
+    html += `<table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <tr style="background:#f8f9fa;">
+        <th style="${TH}">Event</th>
+        <th style="${TH}">Property</th>
+        <th style="${TH}">Dates</th>
+        <th style="${TH}text-align:center;">Impact</th>
+        <th style="${TH}text-align:right;">Hist ADR</th>
+        <th style="${TH}text-align:right;">PL Price</th>
+        <th style="${TH}text-align:right;">Gap</th>
+        <th style="${TH}">Action</th>
+      </tr>`;
+
+    for (const r of tableRows) {
+      html += `<tr style="background:${r.rowBg};border-bottom:1px solid #f0f0f0;">
+        <td style="padding:7px 10px;">
+          <span style="font-weight:600;">${r.ev.name}</span>
+          ${r.isNew ? `<span style="display:inline-block;margin-left:4px;padding:0 5px;background:#7b2d8b22;color:#7b2d8b;border-radius:8px;font-size:10px;font-weight:700;">NEW</span>` : ''}
+          ${r.ev.source !== 'hardcoded' && r.ev.venue ? `<div style="font-size:10px;color:#aaa;">${r.ev.venue}</div>` : ''}
+        </td>
+        <td style="padding:7px 10px;">${badge(r.prop.name, r.prop.color)}</td>
+        <td style="padding:7px 10px;color:#555;white-space:nowrap;">${r.dateRange}</td>
+        <td style="padding:7px 10px;text-align:center;">
+          <span style="display:inline-block;padding:2px 7px;border-radius:8px;font-size:10px;font-weight:700;background:${r.impColor}22;color:${r.impColor};">
+            ${IMPACT_LABEL[r.ev.impact] || r.ev.impact}
+          </span>
+        </td>
+        <td style="padding:7px 10px;text-align:right;">${r.histCell}</td>
+        <td style="padding:7px 10px;text-align:right;font-weight:600;">${r.plCell}</td>
+        <td style="padding:7px 10px;text-align:right;">${r.gapCell}</td>
+        <td style="padding:7px 10px;color:#444;font-size:11px;">
+          <span style="color:${r.alertColor};">${r.alertBadge}</span> ${r.alertText}
+        </td>
+      </tr>`;
+    }
+    html += `</table>`;
+  } else {
+    html += `<p style="color:#888;font-size:13px;font-style:italic;">No events in the next 90 days.</p>`;
+  }
+
+  // 91–120 day lookahead — informational only
+  if (lookahead.length) {
+    html += `<div style="margin-top:16px;padding:12px 16px;background:#f8f9fa;border-radius:6px;border-left:3px solid #ccc;">
+      <div style="font-size:12px;font-weight:700;color:#555;margin-bottom:8px;">📅 Coming Up (91–120 days) — informational</div>`;
+    for (const ev of lookahead) {
+      const affectedProps = PROPERTIES.filter(p => PROP_MARKET[p.id] === ev.market);
+      const propNames = affectedProps.map(p => p.name).join(', ');
+      const dateRange = ev.start_date === ev.end_date
+        ? fmtDate(ev.start_date)
+        : `${fmtDate(ev.start_date)} – ${fmtDate(ev.end_date)}`;
+      const impColor = IMPACT_COLOR[ev.impact] || '#888';
+      const isNew    = ev.discovered_at && ev.discovered_at.slice(0, 10) >= sevenDaysAgo;
+      html += `<div style="display:flex;gap:8px;align-items:baseline;padding:3px 0;font-size:12px;border-bottom:1px solid #eee;">
+        <span style="color:#666;white-space:nowrap;min-width:100px;">${dateRange}</span>
+        <span style="font-weight:600;">${ev.name}${isNew ? ' <span style="color:#7b2d8b;font-size:10px;">NEW</span>' : ''}</span>
+        <span style="color:#888;">${propNames}</span>
+        <span style="margin-left:auto;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:700;background:${impColor}22;color:${impColor};white-space:nowrap;">${IMPACT_LABEL[ev.impact] || ev.impact}</span>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  html += `<p style="font-size:11px;color:#aaa;margin:8px 0 0;">
+    Historical ADR = prorated avg nightly revenue from confirmed bookings on these dates in prior years.
+    Gap = current PriceLabs price vs historical ADR (positive = you're priced above history).
+    🔴 Underpriced: current price &gt;10% below historical ADR.
+    Events marked NEW discovered by weekly scan within last 7 days.
+    ${tmModerateCount > 0 ? `<br><span style="color:#bbb;">+ ${tmModerateCount} additional moderate-impact events (concerts, minor sports) detected by Ticketmaster scan but not shown — they don't typically drive meaningful STR demand shifts individually.</span>` : ''}
+  </p>`;
+
+  return html;
+}
+
 function sectionActivity({ newBookings, cancellations }) {
   if (!newBookings.length && !cancellations.length) {
-    return `<h2 style="${H2}">🔔 Activity — Last 24 Hours</h2>
+    return `<h2 id="section-activity" style="${H2}">🔔 Activity — Last 24 Hours</h2>
     <p style="color:#888;margin:8px 0;font-style:italic;">No new bookings or cancellations in the last 24 hours.</p>`;
   }
-  let html = `<h2 style="${H2}">🔔 Activity — Last 24 Hours</h2>`;
+  let html = `<h2 id="section-activity" style="${H2}">🔔 Activity — Last 24 Hours</h2>`;
   if (newBookings.length) {
     html += `<p style="font-weight:600;margin:8px 0 4px;color:#1a7f5a;">✓ ${newBookings.length} New Booking${newBookings.length > 1 ? 's' : ''}</p>`;
     for (const b of newBookings) {
@@ -699,7 +1424,7 @@ function sectionActivity({ newBookings, cancellations }) {
 
 function sectionOpenNights(bookings, todayStr, taxRates) {
   const t30 = addDays(todayStr, 30), t60 = addDays(todayStr, 60), t90 = addDays(todayStr, 90);
-  let html = `<h2 style="${H2}">📅 Open Nights & Gap Opportunities</h2>`;
+  let html = `<h2 id="section-gaps" style="${H2}">📅 Open Nights & Gap Opportunities</h2>`;
 
   for (const p of PROPERTIES) {
     const o30 = openDates(bookings, p.id, todayStr, t30).length;
@@ -762,7 +1487,7 @@ function sectionOpenNights(bookings, todayStr, taxRates) {
 
 function sectionPrices(bookings, plData, todayStr) {
   const t90 = addDays(todayStr, 90);
-  let html = `<h2 style="${H2}">💰 Pricing — Open Days (Next 90)</h2>`;
+  let html = `<h2 id="section-prices" style="${H2}">💰 Pricing — Open Days (Next 90)</h2>`;
 
   if (!plData) {
     html += `<p style="color:#888;font-style:italic;font-size:13px;">
@@ -846,7 +1571,7 @@ const SECTION = `background:#fff;border-radius:8px;padding:20px 24px;margin-bott
 
 // Note: SVG icons are stripped by Gmail — using emoji instead for universal rendering
 
-function buildEmail(todayStr, sections) {
+function buildEmail(todayStr, sections, priorityBoardHtml = '') {
   const timeStr = new Date().toLocaleString('en-US', {
     timeZone: 'America/Phoenix', hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
   });
@@ -871,6 +1596,7 @@ function buildEmail(todayStr, sections) {
     </table>
   </div>
 
+  ${priorityBoardHtml}
   ${sections.map(s => `<div style="${SECTION}">${s}</div>`).join('')}
 
   <!-- Footer -->
@@ -911,6 +1637,208 @@ async function sendEmail(html, subject) {
   return body;
 }
 
+// ─── Priority Action Board ────────────────────────────────────────────────────
+
+async function fetchLastBookedDates() {
+  const results = await Promise.all(
+    PROPERTIES.map(p =>
+      sb(`bookings?select=property_id,booked_at&property_id=eq.${p.id}&status=eq.active&order=booked_at.desc&limit=1`)
+        .then(rows => ({ propId: p.id, booked_at: rows[0]?.booked_at ?? null }))
+        .catch(() => ({ propId: p.id, booked_at: null }))
+    )
+  );
+  const map = {};
+  for (const r of results) map[r.propId] = r.booked_at;
+  return map;
+}
+
+// Generate the "because" explanation for a pricing alert — used in the Action Board
+function alertBecause(a) {
+  const ptsAbove = a.mktP50 > 0 ? Math.round((a.avgPrice / a.mktP50 - 1) * 100) : 0;
+  const occStr   = a.propOcc != null && a.mktOcc != null ? ` Your occupancy ${a.propOcc}% vs market ${a.mktOcc}%.` : '';
+  const isOccGap = a.propOcc != null && a.mktOcc != null && a.mktOcc > 0 && a.propOcc < a.mktOcc * 0.5;
+  if (isOccGap) {
+    return `Pricing is in line with market but occupancy (${a.propOcc}%) is less than half the market rate (${a.mktOcc}%). Check listing visibility, photos, and reviews — the price may not be the issue.`;
+  }
+  if (a.level === 'RED') {
+    return `${a.nightsAboveP75} of ${a.totalNights} nights are above market p75 and occupancy is lagging.${occStr} At ${ptsAbove}% above market median (${fmt$(a.avgPrice)} vs ${fmt$(a.mktP50)}), bookings are going to lower-priced competitors. Reduce base price in PriceLabs now.`;
+  }
+  const pctAbove = Math.round(a.nightsAboveP75 / a.totalNights * 100);
+  if (pctAbove > 20) {
+    return `${a.nightsAboveP75} of ${a.totalNights} nights (${pctAbove}%) are above market p75.${occStr} At ${ptsAbove}% above market median (${fmt$(a.avgPrice)} vs ${fmt$(a.mktP50)}), advance bookings may be softening. Consider a price reduction in PriceLabs.`;
+  }
+  return `Average price ${ptsAbove}% above market median (${fmt$(a.avgPrice)} vs ${fmt$(a.mktP50)}).${occStr} A modest reduction in PriceLabs may improve booking velocity.`;
+}
+
+function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, activity, mtd, tyBookings, lyBookings, paceMonths, hardcodedEvents, cachedEvents, taxRates, todayStr) {
+  const now = new Date();
+  const t14 = addDays(todayStr, 14);
+  const t30 = addDays(todayStr, 30);
+
+  const summaries = [];
+
+  for (const prop of PROPERTIES) {
+    const settings = alertData?.[prop.plId]?.settings ?? null;
+    const prices   = plData?.[prop.plId] ?? {};
+    const occ      = occupiedSet(bookings, prop.id);
+
+    // ── Synopsis data ────────────────────────────────────────────────────────
+    const propOcc30 = settings ? windowOcc(settings.occupancy_next_30, settings.occupancy_next_60, 30) : null;
+    const mktOcc30  = settings ? windowOcc(settings.market_occupancy_next_30, settings.market_occupancy_next_60, 30) : null;
+    const lastBooked   = lastBookedMap[prop.id];
+    const daysSince    = lastBooked ? Math.floor((now - new Date(lastBooked)) / 86400000) : null;
+
+    let openNext30 = 0;
+    for (let i = 0; i < 30; i++) {
+      const d = addDays(todayStr, i);
+      if (!occ.has(d) && (prices[d]?.price ?? 0) > 0) openNext30++;
+    }
+
+    const synParts = [];
+    if (propOcc30 != null && mktOcc30 != null)
+      synParts.push(`Next 30 days: ${Math.round(propOcc30 * 100)}% occupied (market ${Math.round(mktOcc30 * 100)}%)`);
+    if (daysSince === 0)       synParts.push('booking today');
+    else if (daysSince === 1)  synParts.push('last booking yesterday');
+    else if (daysSince != null) synParts.push(`last booking ${daysSince} days ago`);
+    const synopsis = synParts.join(' · ');
+
+    // ── Action items ─────────────────────────────────────────────────────────
+    const actions = [];
+
+    // 1. Cancellations for this property in last 24h
+    for (const c of (activity.cancellations || [])) {
+      if (c.property_id !== prop.id) continue;
+      const nights = c.nights || Math.max(1, diffDays(c.arrival_date, c.departure_date));
+      actions.push({
+        level: 'red', anchor: '#section-activity', sectionLabel: 'Activity',
+        text: `${c.guest_display_name || 'Guest'} cancelled ${fmtDate(c.arrival_date)}–${fmtDate(c.departure_date)} (${nights} night${nights !== 1 ? 's' : ''}, ${fmt$(c.gross_revenue)} lost). Dates are now open — re-list or contact your waitlist.`,
+      });
+    }
+
+    // 2. Pricing alerts with full "because" explanation
+    if (plData && alertData) {
+      for (const a of computePropertyAlerts(prop, plData, alertData, bookings, todayStr)) {
+        if (a.level === 'OK') continue;
+        actions.push({
+          level: a.level === 'RED' ? 'red' : 'yellow',
+          anchor: '#section-pricing', sectionLabel: 'Pricing Alerts',
+          text: `${a.window}: ${alertBecause(a)}`,
+        });
+      }
+    }
+
+    // 3. HIGH/VERY-HIGH events in next 30 days for this property
+    const seenEvt = new Set();
+    for (const evt of [...hardcodedEvents, ...cachedEvents]) {
+      if (evt.end_date < todayStr || evt.start_date > t30) continue;
+      if (!['high', 'very-high'].includes((evt.impact || '').toLowerCase())) continue;
+      if (PROP_MARKET[prop.id] !== evt.market) continue;
+      const key = `${evt.name}|${evt.start_date}`;
+      if (seenEvt.has(key)) continue;
+      seenEvt.add(key);
+      const dStr = evt.end_date === evt.start_date ? fmtDate(evt.start_date) : `${fmtDate(evt.start_date)}–${fmtDate(evt.end_date)}`;
+      actions.push({
+        level: 'event', anchor: '#section-events', sectionLabel: 'Events',
+        text: `${evt.name} ${dStr} (${(evt.impact || '').replace('-', ' ')} impact) — verify pricing is elevated for these dates.`,
+      });
+    }
+
+    // 4. No new bookings in >21 days with open nights
+    if (plData && daysSince != null && daysSince >= 21 && openNext30 > 0) {
+      actions.push({
+        level: 'watch', anchor: '#section-pricing', sectionLabel: 'Pricing',
+        text: `No new bookings in ${daysSince} days with ${openNext30} open night${openNext30 !== 1 ? 's' : ''} available in the next 30 days. Check listing rank, photos, and reviews across all channels.`,
+      });
+    }
+
+    // 5. Gap nights in next 14 days — top one by value + count
+    const nearGaps = gapNights(bookings, prop.id, todayStr, t14);
+    if (nearGaps.length > 0) {
+      const top  = [...nearGaps].sort((a, b) => ((b.baseRentPerNight || 0) * b.nights) - ((a.baseRentPerNight || 0) * a.nights))[0];
+      const dStr = top.nights === 1 ? fmtDate(top.dates[0]) : `${fmtDate(top.dates[0])}–${fmtDate(top.dates[top.dates.length - 1])}`;
+      const val  = top.baseRentPerNight ? ` ~${fmt$(Math.round(top.baseRentPerNight * top.nights))}` : '';
+      const more = nearGaps.length > 1 ? ` (+${nearGaps.length - 1} more gap${nearGaps.length > 2 ? 's' : ''} this week)` : '';
+      actions.push({
+        level: 'gap', anchor: '#section-gaps', sectionLabel: 'Open Nights',
+        text: `${top.nights}-night gap ${dStr}${val} — contact ${top.prevGuest || 'checkout guest'} or ${top.nextGuest || 'checkin guest'} to fill.${more}`,
+      });
+    }
+
+    // 6. Booking pace >20% behind LY for first pace month
+    const pm = paceMonths[0];
+    let tyRev = 0, lyRev = 0;
+    for (const b of tyBookings) { if (b.property_id === prop.id) tyRev += prorateToMonth(b, pm.start, pm.end).revenue; }
+    for (const b of lyBookings) { if (b.property_id === prop.id) lyRev += prorateToMonth(b, pm.start, pm.end).revenue; }
+    if (lyRev > 200 && tyRev < lyRev * 0.80) {
+      const pct = Math.round((1 - tyRev / lyRev) * 100);
+      actions.push({
+        level: 'watch', anchor: '#section-pace', sectionLabel: 'Booking Pace',
+        text: `${pm.label} bookings are ${pct}% behind last year (${fmt$(Math.round(tyRev))} vs ${fmt$(Math.round(lyRev))}). Consider a promotion or price adjustment to stimulate demand.`,
+      });
+    }
+
+    // ── Status ───────────────────────────────────────────────────────────────
+    const hasRed   = actions.some(a => a.level === 'red');
+    const hasWatch = actions.some(a => ['yellow', 'watch', 'gap', 'event'].includes(a.level));
+    summaries.push({ prop, synopsis, actions, status: hasRed ? 'red' : hasWatch ? 'yellow' : 'green' });
+  }
+
+  // ── Portfolio note (MTD) ──────────────────────────────────────────────────
+  const curRevTotal = mtd.cur.reduce((s, b) => s + (Number(b.gross_revenue) || 0), 0);
+  const lyRevTotal  = mtd.ly.reduce((s, b) => s + (Number(b.gross_revenue) || 0), 0);
+  let portfolioNote = null;
+  if (lyRevTotal > 200 && curRevTotal < lyRevTotal * 0.85) {
+    const pct = Math.round((1 - curRevTotal / lyRevTotal) * 100);
+    portfolioNote = `Portfolio MTD: ${fmt$(Math.round(curRevTotal))} vs ${fmt$(Math.round(lyRevTotal))} last year (${pct}% behind). See MTD Revenue section for property breakdown.`;
+  }
+
+  return { summaries, portfolioNote };
+}
+
+function sectionPriorityBoard({ summaries, portfolioNote }, todayStr) {
+  const boldDollars = str => str.replace(/\$[\d,]+(?:\.\d+)?/g, m => `<strong>${m}</strong>`);
+
+  const STATUS = {
+    red:    { emoji: '🔴', color: '#c0392b', border: '#e74c3c', headerBg: '#fff0f0', cardBorder: '#fcc' },
+    yellow: { emoji: '🟡', color: '#d97706', border: '#d97706', headerBg: '#fffbf0', cardBorder: '#fde68a' },
+    green:  { emoji: '🟢', color: '#1a7f5a', border: '#1a7f5a', headerBg: '#f0faf5', cardBorder: '#a7f3d0' },
+  };
+  const ACTION_COLOR = { red: '#c0392b', yellow: '#d97706', event: '#b45309', gap: '#0369a1', watch: '#555' };
+
+  const boardHeader = `<h2 style="font-size:15px;font-weight:700;color:#1a1a2e;margin:0 0 8px;padding-bottom:10px;border-bottom:2px solid #c5d9ee;">⚡ Today's Action Board — ${fmtDateL(todayStr)}</h2>`;
+  const legend      = `<p style="font-size:11px;color:#666;margin:0 0 14px;padding:0;">🔴 Needs Attention &nbsp;·&nbsp; 🟡 Watch &nbsp;·&nbsp; 🟢 On Track</p>`;
+
+  const cards = summaries.map(({ prop, synopsis, actions, status }) => {
+    const s = STATUS[status];
+    const header = `<table cellpadding="0" cellspacing="0" border="0" style="width:100%;background:${s.headerBg};border-bottom:1px solid ${s.cardBorder};"><tr>
+      <td style="padding:8px 14px;font-weight:700;font-size:13px;color:${s.color};">${s.emoji} ${prop.name}</td>
+      <td style="padding:8px 14px;text-align:right;font-size:11px;color:#888;">${prop.location}</td>
+    </tr></table>`;
+    const syn = synopsis ? `<div style="padding:6px 14px;background:#fafafa;border-bottom:1px solid #f0f0f0;font-size:12px;color:#666;">${synopsis}</div>` : '';
+    let body;
+    if (actions.length === 0) {
+      body = `<div style="padding:10px 14px;font-size:13px;color:#1a7f5a;">✓ No actions needed today.</div>`;
+    } else {
+      const rows = actions.map((a, i) => {
+        const c    = ACTION_COLOR[a.level] || '#555';
+        const jump = `<a href="${a.anchor}" style="font-size:11px;color:#406A94;text-decoration:none;font-weight:600;margin-left:10px;white-space:nowrap;">↓ ${a.sectionLabel}</a>`;
+        const sep  = i < actions.length - 1 ? 'border-bottom:1px solid #f3f4f6;' : '';
+        return `<div style="padding:8px 0;${sep}font-size:13px;line-height:1.5;color:${c};">→ ${boldDollars(a.text)}${jump}</div>`;
+      }).join('');
+      body = `<div style="padding:4px 14px 10px;">${rows}</div>`;
+    }
+    return `<div style="margin-bottom:10px;border-radius:8px;overflow:hidden;border:1px solid ${s.cardBorder};border-left:4px solid ${s.border};">${header}${syn}${body}</div>`;
+  }).join('');
+
+  const portHtml = portfolioNote
+    ? `<div style="margin-top:4px;padding:10px 14px;background:#f8f9fa;border-radius:6px;border-left:3px solid #9ca3af;font-size:12px;color:#555;">📊 ${boldDollars(portfolioNote)} <a href="#section-mtd" style="font-size:11px;color:#406A94;text-decoration:none;font-weight:600;margin-left:8px;">↓ MTD Revenue</a></div>`
+    : '';
+
+  return `<div style="background:#eef4fb;border-radius:10px;padding:18px 24px;margin-bottom:16px;border:1px solid #c5d9ee;border-left:4px solid #406A94;">
+  ${boardHeader}${legend}${cards}${portHtml}
+</div>`;
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 // Sample PriceLabs data for preview mode — realistic demo prices
@@ -949,14 +1877,23 @@ async function main() {
 
   console.log(`Daily report for ${todayStr}${PREVIEW_OUT ? ' [PREVIEW MODE]' : ''}`);
 
-  const [activity, mtd, bookings, taxRates] = await Promise.all([
+  const paceMonths = getPaceMonths(todayStr);
+  const cachedEvents = fetchEventsCache();
+  const [activity, mtd, bookings, taxRates, paceData, forecastData, lastBookedMap] = await Promise.all([
     fetchRecentActivity(),
     fetchMTDRevenue(todayStr),
     fetchBookings90(todayStr, t90),
     fetchTaxRates(),
+    fetchBookingPaceData(paceMonths, todayStr),
+    fetchRevenueForecastData(paceMonths, todayStr),
+    fetchLastBookedDates(),
   ]);
+  const { tyBookings, lyBookings } = paceData;
+  const { tyBlocked, histActive, histBlocked } = forecastData;
 
   console.log(`  Bookings (90d): ${bookings.length} | New: ${activity.newBookings.length} | Cancelled: ${activity.cancellations.length} | MTD: ${mtd.cur.length}`);
+  console.log(`  Pace months: ${paceMonths.map(m => m.label).join(', ')} | TY: ${tyBookings.length} bkgs | LY: ${lyBookings.length} bkgs`);
+  console.log(`  Forecast: ${histActive.length} historical bookings | ${tyBlocked.length} current-yr blocks`);
 
   // PriceLabs: try REST API first, then file fallback, then preview sample
   let plData = loadPriceLabsFile();
@@ -979,15 +1916,28 @@ async function main() {
     catch (e) { console.warn('  Pricing alert fetch failed:', e.message); }
   }
 
+  const hardcodedEvents = getHardcodedEvents(todayStr);
+  console.log(`  Events: ${hardcodedEvents.length} hardcoded + ${cachedEvents.length} from cache`);
+
+  // Priority Action Board: per-property summary with action items
+  console.log('  Building Priority Action Board...');
+  const { summaries, portfolioNote } = buildPropertySummaries(plData, alertData, bookings, lastBookedMap, activity, mtd, tyBookings, lyBookings, paceMonths, hardcodedEvents, cachedEvents, taxRates, todayStr);
+  const priorityBoardHtml = sectionPriorityBoard({ summaries, portfolioNote }, todayStr);
+  const totalActions = summaries.reduce((n, s) => n + s.actions.length, 0);
+  console.log(`  ✓ Priority Action Board: ${totalActions} action items across ${summaries.length} properties`);
+
   const sections = [
     sectionMTD(mtd, todayStr),
     sectionActivity(activity),
-    sectionOpenNights(bookings, todayStr, taxRates),
-    sectionPrices(bookings, plData, todayStr),
     sectionPricingAlerts(plData, alertData, bookings, todayStr),
+    sectionSmartEvents(hardcodedEvents, cachedEvents, plData, histActive, todayStr),
+    sectionOpenNights(bookings, todayStr, taxRates),
+    sectionBookingPace(tyBookings, lyBookings, paceMonths, todayStr),
+    sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData),
+    sectionPrices(bookings, plData, todayStr),
   ];
 
-  const html = buildEmail(todayStr, sections);
+  const html = buildEmail(todayStr, sections, priorityBoardHtml);
   const subject = `PPS Daily Report · ${fmtDateL(todayStr)}`;
 
   if (PREVIEW_OUT) {

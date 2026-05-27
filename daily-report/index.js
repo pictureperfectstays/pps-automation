@@ -433,6 +433,7 @@ function computePropertyAlerts(prop, plData, alertData, bookings, todayStr) {
   const percentiles   = parseMarketPercentiles(market, bedroomCount);
   const mktOccByDate  = parseMarketOccupancy(market, bedroomCount);
   const prices        = plData?.[prop.plId] ?? {};
+  const occ           = occupiedSet(bookings, prop.id); // open nights only — booked nights can't be repriced
 
   // Market occupancy for days 61-90: average from neighborhood_data occupancy series
   const mktOcc61_90Dates = [];
@@ -444,19 +445,19 @@ function computePropertyAlerts(prop, plData, alertData, bookings, todayStr) {
 
   const windows = [
     {
-      label:    'Next 30 days',
+      label:    `Next 30 days (${fmtDate(todayStr)}–${fmtDate(addDays(todayStr, 29))})`,
       startDay: 0, endDay: 30,
       propOcc:  windowOcc(settings.occupancy_next_30, settings.occupancy_next_60, 30),
       mktOcc:   windowOcc(settings.market_occupancy_next_30, settings.market_occupancy_next_60, 30),
     },
     {
-      label:    'Days 31–60',
+      label:    `Days 31–60 (${fmtDate(addDays(todayStr, 30))}–${fmtDate(addDays(todayStr, 59))})`,
       startDay: 30, endDay: 60,
       propOcc:  windowOcc(settings.occupancy_next_30, settings.occupancy_next_60, 60),
       mktOcc:   windowOcc(settings.market_occupancy_next_30, settings.market_occupancy_next_60, 60),
     },
     {
-      label:    'Days 61–90',
+      label:    `Days 61–90 (${fmtDate(addDays(todayStr, 60))}–${fmtDate(addDays(todayStr, 89))})`,
       startDay: 60, endDay: 90,
       propOcc:  propOccFromBookings(bookings, prop.id, 60, 90, todayStr),
       // Market occ from neighborhood_data is unreliable for 61-90 day window —
@@ -469,11 +470,11 @@ function computePropertyAlerts(prop, plData, alertData, bookings, todayStr) {
   const alerts = [];
 
   for (const win of windows) {
-    // Collect all dates in this window that have a price (booked or open)
+    // Collect OPEN dates only — booked nights can't be repriced, so exclude them
     const windowDates = [];
     for (let i = win.startDay; i < win.endDay; i++) windowDates.push(addDays(todayStr, i));
 
-    const datesWithPrice = windowDates.filter(d => prices[d]?.price != null && prices[d].price > 0);
+    const datesWithPrice = windowDates.filter(d => prices[d]?.price != null && prices[d].price > 0 && !occ.has(d));
     if (datesWithPrice.length === 0) continue;
 
     // Use `price` field only — this is the final channel price (what guests see)
@@ -517,7 +518,7 @@ function computePropertyAlerts(prop, plData, alertData, bookings, todayStr) {
     } else if (level === 'RED' && reason === 'occupancy_gap') {
       action = 'Pricing is in line with market — check listing rank, photos, and reviews on Airbnb/VRBO. Low visibility may be the cause.';
     } else if (reason === 'overpriced') {
-      action = `Reduce prices in PriceLabs for this window — ${nightsAboveP75} of ${datesWithPrice.length} nights above p75. Act before the booking window closes.`;
+      action = `Reduce prices in PriceLabs for this window — ${nightsAboveP75} of ${datesWithPrice.length} open nights above p75. Act before the booking window closes.`;
     } else {
       action = `Reduce base price in PriceLabs — avg price ${ptsAbove}% above market median. Adjust now to attract advance bookings.`;
     }
@@ -574,7 +575,7 @@ function sectionPricingAlerts(plData, alertData, bookings, todayStr) {
       <th style="${TH}text-align:center;">Status</th>
       <th style="${TH}text-align:right;">Avg Price</th>
       <th style="${TH}text-align:right;">Mkt Median</th>
-      <th style="${TH}text-align:right;">Nights &gt;p75</th>
+      <th style="${TH}text-align:right;">Open Nts &gt;p75</th>
       <th style="${TH}text-align:right;">Occ / Mkt</th>
       <th style="${TH}">Action</th>
     </tr>`;
@@ -1728,11 +1729,15 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
     }
 
     // 3. HIGH/VERY-HIGH events in next 30 days for this property
+    // Suppress generic "Peak Season" events when a pricing alert already covers the analysis —
+    // showing "elevate prices" alongside "you're above market, reduce prices" is contradictory.
+    const hasPricingAlert = actions.some(a => a.level === 'red' || a.level === 'yellow');
     const seenEvt = new Set();
     for (const evt of [...hardcodedEvents, ...cachedEvents]) {
       if (evt.end_date < todayStr || evt.start_date > t30) continue;
       if (!['high', 'very-high'].includes((evt.impact || '').toLowerCase())) continue;
       if (PROP_MARKET[prop.id] !== evt.market) continue;
+      if (hasPricingAlert && /peak season/i.test(evt.name)) continue;
       const key = `${evt.name}|${evt.start_date}`;
       if (seenEvt.has(key)) continue;
       seenEvt.add(key);

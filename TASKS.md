@@ -1,22 +1,33 @@
 # Picture Perfect Stays — Task List
-Last updated: 2026-05-23
+Last updated: 2026-06-02
 
 ---
 
-## 🔴 In Progress
+## ✅ Phase 1 & 2 — Complete
 
-### 1. Redesign Action Board (daily report)
-Rebuild the top-of-email summary as per-property cards instead of a flat category list.
-- Per-property layout with status indicator (🔴 🟡 🟢) + legend
-- One synopsis line per property (occupancy vs market, revenue trend, last booking)
-- Max 2-3 action items per property, with "because" language built into each one
-- Gap nights: only next 14 days, max one per property
-- Events: only HIGH/VERY-HIGH in next 30 days, attached to relevant property
-- Portfolio note at bottom if MTD/pace is materially off
+- Daily revenue email report (7am AZ via GitHub Actions) ✓
+- Per-property Action Board with 🔴🟡🟢 status, "because" explanations, jump links ✓
+- Pricing alerts (open nights only, actual date ranges, open nights count) ✓
+- Smart event detection (Ticketmaster, ESPN, algorithmic Gulf Coast Jam / Thunder Beach) ✓
+- Gap night outreach with guest names and dollar amounts ✓
+- Booking pace, revenue forecast, MTD revenue, pricing open days ✓
+- Min prices live from PriceLabs API ✓
+- Dynamic booking pace note (auto-updates by season and property age) ✓
+- GitHub Actions workflows live (Node.js 24, all secrets added) ✓
 
 ---
 
-## 🟡 Up Next (in priority order)
+## 🔴 Phase 3 — In Progress
+
+### 1. Tavily web search in scan-events.js
+Add automated web searching for events not found on Ticketmaster — runs inside the
+existing Mon/Thu scan-events workflow alongside Ticketmaster and ESPN.
+- Sign up at tavily.com ✓
+- Add TAVILY_API_KEY to ~/.claude/settings.json ✓
+- Add TAVILY_API_KEY to GitHub Actions secrets (TODO)
+- Add `webSearchEvents(market, year)` function to scan-events.js
+- Use Claude API to parse results into event name/dates/impact
+- Store results in events-cache.json alongside Ticketmaster events
 
 ### 2. Populate pricing_snapshots table
 The `pricing_snapshots` Supabase table has been empty since creation.
@@ -29,15 +40,17 @@ Add a upsert step that writes this data to `pricing_snapshots` each morning.
 - Only runs if PRICELABS_KEY and plData are available
 
 ### 3. Tier 2 — Push pricing changes to PriceLabs from Owner Portal
-Allow approving/dismissing pricing recommendations from a portal page instead of manually opening PriceLabs.
+Allow approving/dismissing pricing recommendations from a portal page instead of
+manually opening PriceLabs.
 
 **Daily report changes:**
-- Write RED/YELLOW pricing alerts to new Supabase `pricing_actions` table (status = 'pending')
-- Don't duplicate — skip if a pending action already exists for same property+window today
+- Write RED/YELLOW pricing alerts to new Supabase `pricing_actions` table (pending)
+- Don't duplicate — skip if pending action already exists for same property+window today
 
 **Supabase changes:**
 - New table: `pricing_actions` (id, property_id, pricelabs_listing_id, window_label,
-  current_avg_price, recommended_base_price, market_median, reason, status, created_at, resolved_at)
+  current_avg_price, recommended_base_price, market_median, reason, status,
+  created_at, resolved_at)
 
 **Owner Portal changes (repo: picture-perfect-stays-portal):**
 - New page: `/actions` — lists pending pricing recommendations with full reason
@@ -47,21 +60,18 @@ Allow approving/dismissing pricing recommendations from a portal page instead of
   `POST /v1/listings` to update base price, marks action applied
 
 Note: PriceLabs API updates base price for the whole listing (not date-range specific).
-"Reduce days 31-60" becomes "reduce base price" — PriceLabs recalculates from there.
-
-### 4. GitHub Actions secrets
-All secrets still need to be added to the GitHub repo before the 7am workflow runs.
-Go to: repo Settings → Secrets and variables → Actions → New repository secret
-- SUPABASE_URL
-- SUPABASE_SERVICE_KEY
-- RESEND_API_KEY
-- PRICELABS_API_KEY
-- TICKETMASTER_API_KEY
-- ANTHROPIC_API_KEY
 
 ---
 
-## 🔵 Planned (not yet scheduled)
+## 🟡 Phase 4 — Up Next
+
+### 4. Operations Manual (Word document)
+Write a full O&M manual for the daily revenue report — to be done once Phase 3 is complete.
+- Cover page with Picture Perfect Stays logo and company info
+- Auto-generated table of contents
+- One section per report section explaining how it works and how to act on it
+- Technical reference appendix (GitHub Actions schedule, secrets, manual re-run, troubleshooting)
+- Delivered as .docx (Chris can PDF it to share)
 
 ### 5. Owner Revenue Report (Owner Portal)
 Property-specific report page in the portal — one per owner, showing only their property.
@@ -78,9 +88,13 @@ Auto-update PriceLabs minimum prices based on season.
 - Uses `seasonal_price_floors` table in Supabase
 - Runs on a schedule or triggered from the portal
 
+---
+
+## 🔵 Phase 5 — Planned
+
 ### 8. Revenue Estimator
 Estimate expected revenue for future months based on historical data.
-- Depends on: pricing_snapshots table being populated (task 2)
+- Depends on: pricing_snapshots table being populated (Phase 3, task 2)
 
 ### 9. Invoice / Stripe integration
 Generate and send owner invoices automatically.

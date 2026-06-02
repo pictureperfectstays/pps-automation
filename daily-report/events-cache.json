@@ -1,5 +1,5 @@
 {
-  "last_updated": "2026-06-02T22:47:30.002Z",
+  "last_updated": "2026-06-02T22:56:07.963Z",
   "scan_date": "2026-06-02",
   "events": [
     {
@@ -3689,6 +3689,90 @@
       "url": "https://www.ticketmaster.com/ryan-castro-sende-the-last-dance-tempe-arizona-09-30-2026/event/190064B58CE44CD2",
       "notes": "",
       "discovered_at": "2026-06-02T20:41:41.268Z"
+    },
+    {
+      "id": "web-verify-gulf-coast-jam-2027",
+      "name": "Gulf Coast Jam",
+      "market": "Panama City Beach",
+      "start_date": "2027-06-03",
+      "end_date": "2027-06-06",
+      "impact": "high",
+      "is_watch": false,
+      "source": "web-search",
+      "notes": "Dates verified via web search for 2027.",
+      "discovered_at": "2026-06-02T22:55:44.610Z"
+    },
+    {
+      "id": "web-verify-thunder-beach-spring-2027",
+      "name": "Thunder Beach Spring Rally",
+      "market": "Panama City Beach",
+      "start_date": "2027-04-28",
+      "end_date": "2027-05-02",
+      "impact": "high",
+      "is_watch": false,
+      "source": "web-search",
+      "notes": "Dates verified via web search for 2027.",
+      "discovered_at": "2026-06-02T22:55:46.699Z"
+    },
+    {
+      "id": "web-verify-barrett-jackson-2027",
+      "name": "Barrett-Jackson Scottsdale",
+      "market": "Scottsdale",
+      "start_date": "2027-01-23",
+      "end_date": "2027-01-31",
+      "impact": "very-high",
+      "is_watch": false,
+      "source": "web-search",
+      "notes": "Dates verified via web search for 2027.",
+      "discovered_at": "2026-06-02T22:55:51.593Z"
+    },
+    {
+      "id": "web-verify-wm-phoenix-open-2027",
+      "name": "WM Phoenix Open",
+      "market": "Scottsdale",
+      "start_date": "2027-02-08",
+      "end_date": "2027-02-14",
+      "impact": "very-high",
+      "is_watch": false,
+      "source": "web-search",
+      "notes": "Dates verified via web search for 2027.",
+      "discovered_at": "2026-06-02T22:55:54.222Z"
+    },
+    {
+      "id": "web-verify-country-thunder-az-2027",
+      "name": "Country Thunder Arizona",
+      "market": "Scottsdale",
+      "start_date": "2027-04-08",
+      "end_date": "2027-04-11",
+      "impact": "high",
+      "is_watch": false,
+      "source": "web-search",
+      "notes": "Dates verified via web search for 2027.",
+      "discovered_at": "2026-06-02T22:55:56.591Z"
+    },
+    {
+      "id": "web-verify-smoky-mtn-songwriters-2026",
+      "name": "Smoky Mountain Songwriters Festival",
+      "market": "Sevierville",
+      "start_date": "2026-08-21",
+      "end_date": "2026-08-23",
+      "impact": "high",
+      "is_watch": false,
+      "source": "web-search",
+      "notes": "Dates verified via web search for 2026.",
+      "discovered_at": "2026-06-02T22:56:00.140Z"
+    },
+    {
+      "id": "web-discover-seabreeze-jazz-festival-2027-04-21",
+      "name": "Seabreeze Jazz Festival",
+      "market": "Panama City Beach",
+      "start_date": "2027-04-21",
+      "end_date": "2027-04-25",
+      "impact": "high",
+      "is_watch": false,
+      "source": "web-search",
+      "notes": "Discovered via web search. Source: https://sowal.com/event/seabreeze-jazz-festival-5",
+      "discovered_at": "2026-06-02T22:56:03.443Z"
     }
   ]
 }

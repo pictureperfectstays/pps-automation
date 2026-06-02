@@ -29,13 +29,10 @@ const SUPABASE_KEY  = ENV.SUPABASE_SERVICE_KEY;
 const RESEND_KEY    = ENV.RESEND_API_KEY;
 const TM_KEY        = ENV.TICKETMASTER_API_KEY;
 const TAVILY_KEY    = ENV.TAVILY_API_KEY;
-const ANTHROPIC_KEY = ENV.ANTHROPIC_API_KEY;
-
 if (!SUPABASE_URL || !SUPABASE_KEY) { console.error('Missing Supabase credentials'); process.exit(1); }
 if (!RESEND_KEY)    { console.error('Missing RESEND_API_KEY'); process.exit(1); }
 if (!TM_KEY)        { console.warn('Warning: TICKETMASTER_API_KEY not set — skipping Ticketmaster scan'); }
 if (!TAVILY_KEY)    { console.warn('Warning: TAVILY_API_KEY not set — skipping web search'); }
-if (!ANTHROPIC_KEY) { console.warn('Warning: ANTHROPIC_API_KEY not set — skipping web search parsing'); }
 
 const SEND_TO   = 'chris@staypictureperfect.com';
 const SEND_FROM = 'reports@mail.staypictureperfect.com';
@@ -335,23 +332,74 @@ async function fetchAllSportsEvents() {
   return results;
 }
 
-// ─── Tavily Web Search ────────────────────────────────────────────────────────
+// ─── Tavily Web Search (no AI credits required) ──────────────────────────────
 
-// Targeted queries per market — {year} is replaced with actual year at runtime
-const MARKET_SEARCHES = {
-  [MARKETS.PCB]: [
-    'Panama City Beach Florida major events festivals {year} dates',
-    'Panama City Beach FL annual events schedule {year}',
-  ],
-  [MARKETS.SCOTTSDALE]: [
-    'Scottsdale Arizona major events festivals conventions {year} dates',
-    'Scottsdale Tempe Mesa large events schedule {year}',
-  ],
-  [MARKETS.SEVIERVILLE]: [
-    'Pigeon Forge Gatlinburg Sevierville Tennessee major events {year} dates',
-    'Smoky Mountains large festivals events schedule {year}',
-  ],
+// Tier 1: Known high-impact events — targeted searches give reliable date results
+const VERIFY_EVENTS = [
+  // Panama City Beach
+  { name: 'Gulf Coast Jam',             market: MARKETS.PCB,         impact: 'high',      idBase: 'gulf-coast-jam',       query: 'Gulf Coast Jam Panama City Beach {year} dates May' },
+  { name: 'Thunder Beach Spring Rally', market: MARKETS.PCB,         impact: 'high',      idBase: 'thunder-beach-spring', query: 'Thunder Beach Motorcycle Rally Panama City Beach spring {year} dates' },
+  { name: 'Thunder Beach Fall Rally',   market: MARKETS.PCB,         impact: 'high',      idBase: 'thunder-beach-fall',   query: 'Thunder Beach Motorcycle Rally Panama City Beach fall October {year} dates' },
+  // Scottsdale
+  { name: 'Barrett-Jackson Scottsdale', market: MARKETS.SCOTTSDALE,  impact: 'very-high', idBase: 'barrett-jackson',      query: 'Barrett-Jackson Scottsdale auction {year} dates January' },
+  { name: 'WM Phoenix Open',            market: MARKETS.SCOTTSDALE,  impact: 'very-high', idBase: 'wm-phoenix-open',      query: 'WM Phoenix Open golf TPC Scottsdale {year} dates February' },
+  { name: 'Country Thunder Arizona',    market: MARKETS.SCOTTSDALE,  impact: 'high',      idBase: 'country-thunder-az',   query: 'Country Thunder Arizona festival {year} dates April' },
+  // Sevierville / Smokies
+  { name: 'Gatlinburg Winterfest',      market: MARKETS.SEVIERVILLE, impact: 'high',      idBase: 'gatlinburg-winterfest', query: 'Gatlinburg Winterfest light festival {year} dates November December' },
+  { name: 'Smoky Mountain Songwriters Festival', market: MARKETS.SEVIERVILLE, impact: 'high', idBase: 'smoky-mtn-songwriters', query: 'Smoky Mountain Songwriters Festival Gatlinburg {year} dates' },
+];
+
+// Tier 2: Broad discovery searches for events we don't already know about
+const DISCOVERY_SEARCHES = {
+  [MARKETS.PCB]:        'major annual events festivals Panama City Beach Florida {year}',
+  [MARKETS.SCOTTSDALE]: 'major annual events festivals Scottsdale Arizona {year}',
+  [MARKETS.SEVIERVILLE]: 'major annual events festivals Pigeon Forge Gatlinburg Tennessee {year}',
 };
+
+// Impact scoring keywords
+const VERY_HIGH_KW = /\b(\d{2,3}[,\s]?000\s*(?:attend|visitor|crowd|people)|championship|world series|super bowl|fills? (?:the )?(?:city|market))\b/i;
+const HIGH_KW      = /\b(\d{1,2}[,\s]?000\s*(?:attend|visitor|crowd|people)|festival|rally|annual|convention|expo|thousands)\b/i;
+const SKIP_TITLE   = /\b(things to do|events near|list of|best events|calendar|what to do|guide to)\b/i;
+
+// Month name → number
+const MONTH_NUM = {
+  jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3, apr: 4, april: 4,
+  may: 5, jun: 6, june: 6, jul: 7, july: 7, aug: 8, august: 8,
+  sep: 9, sept: 9, september: 9, oct: 10, october: 10, nov: 11, november: 11, dec: 12, december: 12,
+};
+const mNum = s => MONTH_NUM[s.toLowerCase().replace(/[^a-z]/g, '').slice(0, 4)] || MONTH_NUM[s.toLowerCase().replace(/[^a-z]/g, '').slice(0, 3)];
+const pad  = n => String(n).padStart(2, '0');
+const iso  = (y, m, d) => `${y}-${pad(m)}-${pad(d)}`;
+
+function extractDateRanges(text, year) {
+  const yr = String(year);
+  const mo = 'jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?';
+  const found = [];
+  let m;
+
+  // "May 28-31, 2026"
+  const re1 = new RegExp(`\\b(${mo})\\.?\\s+(\\d{1,2})\\s*[-–—]\\s*(\\d{1,2})[,\\s]+${yr}\\b`, 'gi');
+  while ((m = re1.exec(text)) !== null) {
+    const mn = mNum(m[1]);
+    if (mn) found.push({ start: iso(year, mn, m[2]), end: iso(year, mn, m[3]) });
+  }
+
+  // "May 28 – June 1, 2026"
+  const re2 = new RegExp(`\\b(${mo})\\.?\\s+(\\d{1,2})\\s*[-–—]\\s*(${mo})\\.?\\s+(\\d{1,2})[,\\s]+${yr}\\b`, 'gi');
+  while ((m = re2.exec(text)) !== null) {
+    const mn1 = mNum(m[1]), mn2 = mNum(m[3]);
+    if (mn1 && mn2) found.push({ start: iso(year, mn1, m[2]), end: iso(year, mn2, m[4]) });
+  }
+
+  // "2026: May 28-31" or "2026 May 28-31" (year-first)
+  const re3 = new RegExp(`${yr}[:\\s]+(${mo})\\.?\\s+(\\d{1,2})\\s*[-–—]\\s*(\\d{1,2})\\b`, 'gi');
+  while ((m = re3.exec(text)) !== null) {
+    const mn = mNum(m[1]);
+    if (mn) found.push({ start: iso(year, mn, m[2]), end: iso(year, mn, m[3]) });
+  }
+
+  return found;
+}
 
 async function tavilySearch(query) {
   const res = await fetch('https://api.tavily.com/search', {
@@ -364,81 +412,72 @@ async function tavilySearch(query) {
   return data.results || [];
 }
 
-async function parseEventsWithClaude(market, results, year) {
-  const content = results.map(r => `URL: ${r.url}\nTitle: ${r.title}\nContent: ${r.content}`).join('\n\n---\n\n');
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1000,
-      system: `Extract events from web search results for short-term rental pricing decisions in ${market}.
-Return ONLY a valid JSON array — no other text. Include events that:
-- Drive significant rental demand (festivals, large concerts, major sports, conventions, car shows, air shows, etc.)
-- Have specific dates in ${year} or ${year + 1}
-- Expected attendance 5,000+ or known to fill local hotels
-
-Each item: { "name": string, "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "impact": "high"|"very-high", "notes": string }
-impact "very-high" = 50k+ attendance or fills the entire market.
-impact "high" = 5k–50k or strong local hotel demand.
-Skip events with no specific dates. Return [] if nothing qualifies.`,
-      messages: [{ role: 'user', content: `Find events in ${market}:\n\n${content}` }],
-    }),
-  });
-  if (!res.ok) { const err = await res.text(); console.warn(`    Claude parse failed: ${res.status} — ${err.slice(0, 120)}`); return []; }
-  const data = await res.json();
-  const text = data.content?.[0]?.text?.trim() || '[]';
-  try { return JSON.parse(text); } catch { console.warn('    Could not parse Claude JSON response'); return []; }
-}
-
 function isValidIsoDate(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(s + 'T00:00:00Z'));
 }
 
 async function webSearchEvents(year) {
-  if (!TAVILY_KEY || !ANTHROPIC_KEY) return [];
-
+  if (!TAVILY_KEY) return [];
   const allFound = [];
+  const nextYear = year + 1;
 
-  for (const [market, queryTemplates] of Object.entries(MARKET_SEARCHES)) {
-    console.log(`  Web search: ${market}...`);
-    const allResults = [];
+  // ── Tier 1: Targeted verification of known high-impact events ────────────
+  console.log('  Web search tier 1: verifying known events...');
+  for (const evDef of VERIFY_EVENTS) {
+    for (const y of [year, nextYear]) {
+      const query   = evDef.query.replace(/\{year\}/g, String(y));
+      const results = await tavilySearch(query);
+      if (!results.length) { await new Promise(r => setTimeout(r, 200)); continue; }
 
-    for (const template of queryTemplates) {
-      for (const y of [year, year + 1]) {
-        const query = template.replace(/\{year\}/g, String(y));
-        const results = await tavilySearch(query);
-        allResults.push(...results);
-        await new Promise(r => setTimeout(r, 300));
+      const allText = results.map(r => `${r.title} ${r.content}`).join(' ');
+      const dates   = extractDateRanges(allText, y);
+
+      if (dates.length > 0) {
+        const { start, end } = dates[0];
+        allFound.push({
+          id: `web-verify-${evDef.idBase}-${y}`, name: evDef.name, market: evDef.market,
+          start_date: start, end_date: end, impact: evDef.impact,
+          is_watch: false, source: 'web-search',
+          notes: `Dates verified via web search for ${y}.`,
+          discovered_at: new Date().toISOString(),
+        });
+        console.log(`    ✓ ${evDef.name} ${y}: ${start} – ${end}`);
+      } else {
+        console.log(`    ~ ${evDef.name} ${y}: dates not found`);
       }
-    }
-
-    // Deduplicate search results by URL before sending to Claude
-    const unique = [...new Map(allResults.map(r => [r.url, r])).values()].slice(0, 10);
-    console.log(`    ${unique.length} unique results — parsing with Claude Haiku...`);
-
-    const parsed = await parseEventsWithClaude(market, unique, year);
-    console.log(`    → ${parsed.length} events extracted`);
-
-    for (const ev of parsed) {
-      if (!ev.name || !isValidIsoDate(ev.start_date) || !isValidIsoDate(ev.end_date)) continue;
-      const slug = ev.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40);
-      allFound.push({
-        id:           `web-${slug}-${ev.start_date}`,
-        name:         ev.name,
-        market,
-        start_date:   ev.start_date,
-        end_date:     ev.end_date,
-        impact:       ['high', 'very-high'].includes(ev.impact) ? ev.impact : 'high',
-        is_watch:     false,
-        source:       'web-search',
-        notes:        ev.notes || '',
-        discovered_at: new Date().toISOString(),
-      });
+      await new Promise(r => setTimeout(r, 250));
     }
   }
 
-  return allFound;
+  // ── Tier 2: Broad discovery for events we don't know about yet ───────────
+  console.log('  Web search tier 2: discovering new events...');
+  for (const [market, queryTemplate] of Object.entries(DISCOVERY_SEARCHES)) {
+    for (const y of [year, nextYear]) {
+      const results = await tavilySearch(queryTemplate.replace(/\{year\}/g, String(y)));
+      for (const r of results) {
+        if (SKIP_TITLE.test(r.title)) continue;
+        const text  = `${r.title} ${r.content}`;
+        const dates = extractDateRanges(text, y);
+        if (!dates.length) continue;
+        if (!HIGH_KW.test(text) && !VERY_HIGH_KW.test(text)) continue; // require impact signal
+
+        const { start, end } = dates[0];
+        const name = r.title.split(/[|\-–]/)[0].trim().slice(0, 80);
+        const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40);
+        allFound.push({
+          id: `web-discover-${slug}-${start}`, name, market,
+          start_date: start, end_date: end,
+          impact: VERY_HIGH_KW.test(text) ? 'very-high' : 'high',
+          is_watch: false, source: 'web-search',
+          notes: `Discovered via web search. Source: ${r.url}`,
+          discovered_at: new Date().toISOString(),
+        });
+      }
+      await new Promise(r => setTimeout(r, 250));
+    }
+  }
+
+  return allFound.filter(ev => isValidIsoDate(ev.start_date) && isValidIsoDate(ev.end_date));
 }
 
 // ─── Merge & Dedup ────────────────────────────────────────────────────────────
@@ -620,8 +659,8 @@ async function main() {
   const futureEspn = espnEvents.filter(ev => ev.start_date >= todayStr);
   freshEvents.push(...futureEspn);
 
-  // Tavily web search — discovers events not on Ticketmaster
-  console.log('  Scanning web for events (Tavily + Claude)...');
+  // Tavily web search — targeted verification + broad discovery (no AI credits needed)
+  console.log('  Scanning web for events (Tavily)...');
   try {
     const webEvents = await webSearchEvents(parseInt(todayStr.slice(0, 4)));
     const futureWeb = webEvents.filter(ev => ev.start_date >= todayStr);

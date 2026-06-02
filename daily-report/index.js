@@ -956,7 +956,33 @@ function sectionMTD(mtd, todayStr) {
 function sectionBookingPace(tyBookings, lyBookings, paceMonths, todayStr) {
   const lySnapshotLabel = fmtDate(addDays(todayStr, -365));
   let html = `<h2 id="section-pace" style="${H2}">📈 Booking Pace vs Last Year</h2>`;
-  html += `<p style="font-size:12px;color:#888;margin:0 0 16px;">Revenue on the books for each upcoming month — today vs. same date last year (${lySnapshotLabel}).</p>`;
+
+  // Build dynamic context notes — auto-update as conditions change
+  const contextNotes = [];
+
+  // Note 1: Non-Scottsdale properties with zero LY bookings = genuinely new/no prior-year data
+  // (Scottsdale zero-LY is explained by the short-notice note below, not a data gap)
+  const noLyProps = PROPERTIES.filter(p =>
+    !lyBookings.some(b => b.property_id === p.id) &&
+    !p.location.includes('Scottsdale')
+  );
+  if (noLyProps.length > 0)
+    contextNotes.push(`${noLyProps.map(p => p.name).join(' & ')} show${noLyProps.length === 1 ? 's' : ''} $0 LY — no prior-year data at this snapshot point`);
+
+  // Note 2: Any pace month in May–Sep for a Scottsdale property = last-minute booking market
+  const scPropIds = new Set(PROPERTIES.filter(p => p.location.includes('Scottsdale')).map(p => p.id));
+  const hasScottsdaleSummer = paceMonths.some(m => {
+    const mo = parseInt(m.start.slice(5, 7));
+    return mo >= 5 && mo <= 9;
+  }) && scPropIds.size > 0;
+  if (hasScottsdaleSummer)
+    contextNotes.push('Scottsdale summer books short-notice, so low LY figures there are expected');
+
+  const contextStr = contextNotes.length
+    ? ` ${contextNotes.join('. ')}.`
+    : '';
+
+  html += `<p style="font-size:12px;color:#888;margin:0 0 16px;">Advance booking snapshot: revenue on books today vs. the same snapshot from ${lySnapshotLabel} last year — not LY final actuals.${contextStr}</p>`;
 
   for (const month of paceMonths) {
     const ty = {}, ly = {};

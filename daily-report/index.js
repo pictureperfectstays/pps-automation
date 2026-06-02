@@ -317,6 +317,54 @@ function loadPriceLabsFile() {
   catch (e) { console.warn('Could not read PRICELABS_DATA_FILE:', e.message); return null; }
 }
 
+// Snapshot today's PriceLabs prices to Supabase for historical analysis.
+// Upserts on (property_id, date) — safe to run daily, overwrites with latest data.
+async function snapshotPriceLabsData(plData, capturedAt) {
+  const rows = [];
+  for (const prop of PROPERTIES) {
+    const prices = plData[prop.plId] || {};
+    for (const [date, row] of Object.entries(prices)) {
+      if (!row) continue;
+      rows.push({
+        property_id:           prop.id,
+        pricelabs_listing_id:  prop.plId,
+        date,
+        recommended_price:     row.price > 0  ? row.price     : null,
+        user_price:            row.user_price > 0 ? row.user_price : null, // -1 = no override
+        uncustomized_price:    null,   // not in current plData structure
+        min_stay:              row.min_stay  || null,
+        booking_status:        row.booking_status ?? '',
+        demand_level:          row.demand_desc || null,
+        adr:                   null,   // filled later from actual bookings
+        captured_at:           capturedAt,
+      });
+    }
+  }
+  if (!rows.length) return 0;
+
+  const CHUNK = 500;
+  let upserted = 0;
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/pricing_snapshots`, {
+      method: 'POST',
+      headers: {
+        apikey:         SUPABASE_KEY,
+        Authorization:  `Bearer ${SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer:         'resolution=merge-duplicates',
+      },
+      body: JSON.stringify(rows.slice(i, i + CHUNK)),
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      console.warn(`  pricing_snapshots chunk ${Math.floor(i/CHUNK)+1} failed: ${err.slice(0, 120)}`);
+    } else {
+      upserted += rows.slice(i, i + CHUNK).length;
+    }
+  }
+  return upserted;
+}
+
 // ─── PriceLabs Pricing Alerts ─────────────────────────────────────────────────
 
 async function plGet(path) {
@@ -1940,6 +1988,14 @@ async function main() {
     plData = buildSamplePlData(bookings, todayStr);
   }
   console.log(`  PriceLabs data: ${plData ? 'loaded (' + Object.keys(plData).length + ' listings)' : 'not available'}`);
+
+  // Snapshot PriceLabs prices to Supabase for historical analysis
+  if (plData && PRICELABS_KEY && !PREVIEW_OUT) {
+    try {
+      const n = await snapshotPriceLabsData(plData, new Date().toISOString());
+      console.log(`  ✓ pricing_snapshots: ${n} rows upserted`);
+    } catch (e) { console.warn('  pricing_snapshots failed (non-fatal):', e.message); }
+  }
 
   // Pricing alerts: listing settings + neighborhood market percentiles
   let alertData = null;

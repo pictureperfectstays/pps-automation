@@ -16,27 +16,26 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function loadEnv() {
   const env = { ...process.env };
-  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) {
-    try {
-      const localPath = join(__dirname, 'settings.json');
-      const globalPath = join(homedir(), '.claude', 'settings.json');
-      const p = existsSync(localPath) ? localPath : globalPath;
-      const s = JSON.parse(readFileSync(p, 'utf8'));
-      if (s.env) Object.assign(env, s.env);
-    } catch {}
+  // Always merge both global and local settings so all keys are available locally
+  for (const p of [join(homedir(), '.claude', 'settings.json'), join(__dirname, 'settings.json')]) {
+    try { const s = JSON.parse(readFileSync(p, 'utf8')); if (s.env) Object.assign(env, s.env); } catch {}
   }
   return env;
 }
 
 const ENV = loadEnv();
-const SUPABASE_URL = ENV.SUPABASE_URL;
-const SUPABASE_KEY = ENV.SUPABASE_SERVICE_KEY;
-const RESEND_KEY   = ENV.RESEND_API_KEY;
-const TM_KEY       = ENV.TICKETMASTER_API_KEY;
+const SUPABASE_URL  = ENV.SUPABASE_URL;
+const SUPABASE_KEY  = ENV.SUPABASE_SERVICE_KEY;
+const RESEND_KEY    = ENV.RESEND_API_KEY;
+const TM_KEY        = ENV.TICKETMASTER_API_KEY;
+const TAVILY_KEY    = ENV.TAVILY_API_KEY;
+const ANTHROPIC_KEY = ENV.ANTHROPIC_API_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) { console.error('Missing Supabase credentials'); process.exit(1); }
-if (!RESEND_KEY)   { console.error('Missing RESEND_API_KEY'); process.exit(1); }
-if (!TM_KEY)       { console.warn('Warning: TICKETMASTER_API_KEY not set — skipping Ticketmaster scan'); }
+if (!RESEND_KEY)    { console.error('Missing RESEND_API_KEY'); process.exit(1); }
+if (!TM_KEY)        { console.warn('Warning: TICKETMASTER_API_KEY not set — skipping Ticketmaster scan'); }
+if (!TAVILY_KEY)    { console.warn('Warning: TAVILY_API_KEY not set — skipping web search'); }
+if (!ANTHROPIC_KEY) { console.warn('Warning: ANTHROPIC_API_KEY not set — skipping web search parsing'); }
 
 const SEND_TO   = 'chris@staypictureperfect.com';
 const SEND_FROM = 'reports@mail.staypictureperfect.com';
@@ -336,6 +335,112 @@ async function fetchAllSportsEvents() {
   return results;
 }
 
+// ─── Tavily Web Search ────────────────────────────────────────────────────────
+
+// Targeted queries per market — {year} is replaced with actual year at runtime
+const MARKET_SEARCHES = {
+  [MARKETS.PCB]: [
+    'Panama City Beach Florida major events festivals {year} dates',
+    'Panama City Beach FL annual events schedule {year}',
+  ],
+  [MARKETS.SCOTTSDALE]: [
+    'Scottsdale Arizona major events festivals conventions {year} dates',
+    'Scottsdale Tempe Mesa large events schedule {year}',
+  ],
+  [MARKETS.SEVIERVILLE]: [
+    'Pigeon Forge Gatlinburg Sevierville Tennessee major events {year} dates',
+    'Smoky Mountains large festivals events schedule {year}',
+  ],
+};
+
+async function tavilySearch(query) {
+  const res = await fetch('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ api_key: TAVILY_KEY, query, max_results: 5, search_depth: 'basic' }),
+  });
+  if (!res.ok) { console.warn(`    Tavily ${res.status}: ${query}`); return []; }
+  const data = await res.json();
+  return data.results || [];
+}
+
+async function parseEventsWithClaude(market, results, year) {
+  const content = results.map(r => `URL: ${r.url}\nTitle: ${r.title}\nContent: ${r.content}`).join('\n\n---\n\n');
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1000,
+      system: `Extract events from web search results for short-term rental pricing decisions in ${market}.
+Return ONLY a valid JSON array — no other text. Include events that:
+- Drive significant rental demand (festivals, large concerts, major sports, conventions, car shows, air shows, etc.)
+- Have specific dates in ${year} or ${year + 1}
+- Expected attendance 5,000+ or known to fill local hotels
+
+Each item: { "name": string, "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "impact": "high"|"very-high", "notes": string }
+impact "very-high" = 50k+ attendance or fills the entire market.
+impact "high" = 5k–50k or strong local hotel demand.
+Skip events with no specific dates. Return [] if nothing qualifies.`,
+      messages: [{ role: 'user', content: `Find events in ${market}:\n\n${content}` }],
+    }),
+  });
+  if (!res.ok) { const err = await res.text(); console.warn(`    Claude parse failed: ${res.status} — ${err.slice(0, 120)}`); return []; }
+  const data = await res.json();
+  const text = data.content?.[0]?.text?.trim() || '[]';
+  try { return JSON.parse(text); } catch { console.warn('    Could not parse Claude JSON response'); return []; }
+}
+
+function isValidIsoDate(s) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(s + 'T00:00:00Z'));
+}
+
+async function webSearchEvents(year) {
+  if (!TAVILY_KEY || !ANTHROPIC_KEY) return [];
+
+  const allFound = [];
+
+  for (const [market, queryTemplates] of Object.entries(MARKET_SEARCHES)) {
+    console.log(`  Web search: ${market}...`);
+    const allResults = [];
+
+    for (const template of queryTemplates) {
+      for (const y of [year, year + 1]) {
+        const query = template.replace(/\{year\}/g, String(y));
+        const results = await tavilySearch(query);
+        allResults.push(...results);
+        await new Promise(r => setTimeout(r, 300));
+      }
+    }
+
+    // Deduplicate search results by URL before sending to Claude
+    const unique = [...new Map(allResults.map(r => [r.url, r])).values()].slice(0, 10);
+    console.log(`    ${unique.length} unique results — parsing with Claude Haiku...`);
+
+    const parsed = await parseEventsWithClaude(market, unique, year);
+    console.log(`    → ${parsed.length} events extracted`);
+
+    for (const ev of parsed) {
+      if (!ev.name || !isValidIsoDate(ev.start_date) || !isValidIsoDate(ev.end_date)) continue;
+      const slug = ev.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40);
+      allFound.push({
+        id:           `web-${slug}-${ev.start_date}`,
+        name:         ev.name,
+        market,
+        start_date:   ev.start_date,
+        end_date:     ev.end_date,
+        impact:       ['high', 'very-high'].includes(ev.impact) ? ev.impact : 'high',
+        is_watch:     false,
+        source:       'web-search',
+        notes:        ev.notes || '',
+        discovered_at: new Date().toISOString(),
+      });
+    }
+  }
+
+  return allFound;
+}
+
 // ─── Merge & Dedup ────────────────────────────────────────────────────────────
 
 function mergeEvents(existing, fresh) {
@@ -512,9 +617,19 @@ async function main() {
   // ESPN sports schedules
   console.log('  Scanning ESPN sports schedules...');
   const espnEvents = await fetchAllSportsEvents();
-  // Filter ESPN to future dates only
   const futureEspn = espnEvents.filter(ev => ev.start_date >= todayStr);
   freshEvents.push(...futureEspn);
+
+  // Tavily web search — discovers events not on Ticketmaster
+  console.log('  Scanning web for events (Tavily + Claude)...');
+  try {
+    const webEvents = await webSearchEvents(parseInt(todayStr.slice(0, 4)));
+    const futureWeb = webEvents.filter(ev => ev.start_date >= todayStr);
+    freshEvents.push(...futureWeb);
+    console.log(`  Web search found: ${futureWeb.length} events`);
+  } catch (e) {
+    console.warn(`  Web search failed (skipping): ${e.message}`);
+  }
 
   console.log(`  Total fresh events: ${freshEvents.length}`);
 

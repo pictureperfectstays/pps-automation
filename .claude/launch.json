@@ -2,10 +2,16 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "daily-report-preview",
-      "runtimeExecutable": "node",
-      "runtimeArgs": ["-e", "const h=require('http'),fs=require('fs'),p=require('os').tmpdir()+'/pps-daily-preview.html';h.createServer((q,r)=>{r.writeHead(200,{'Content-Type':'text/html'});r.end(fs.readFileSync(p))}).listen(4321,()=>console.log('ready'))"],
+      "name": "preview-report",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["serve", "daily-report", "-l", "4321", "--no-clipboard"],
       "port": 4321
+    },
+    {
+      "name": "portal",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["serve", "C:\\Users\\crhan\\Projects\\picture-perfect-stays-portal", "-l", "4322", "--no-clipboard"],
+      "port": 4322
     }
   ]
 }

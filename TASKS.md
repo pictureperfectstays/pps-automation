@@ -34,7 +34,7 @@ Two-tier approach — no AI credits needed:
 - Skipped in preview mode, fails gracefully without blocking email send
 - First run: 364 rows captured 2026-06-02 ✓
 
-### 3. Tier 2 — Push pricing changes to PriceLabs from Owner Portal 🔴 UP NEXT
+### 3. Tier 2 — Push pricing changes to PriceLabs from Owner Portal ✅ COMPLETE
 Allow approving/dismissing pricing recommendations from the Owner Portal instead of
 manually opening PriceLabs each time.
 

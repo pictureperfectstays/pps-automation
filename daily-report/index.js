@@ -317,6 +317,64 @@ function loadPriceLabsFile() {
   catch (e) { console.warn('Could not read PRICELABS_DATA_FILE:', e.message); return null; }
 }
 
+// Write RED/YELLOW pricing alerts to pricing_actions table.
+// Skips windows that already have a pending action today.
+async function savePricingActions(plData, alertData, bookings, todayStr) {
+  if (!SUPABASE_URL || !SUPABASE_KEY || !alertData || !plData) return 0;
+
+  // Fetch existing pending actions created today to avoid duplicates
+  const sinceToday = todayStr + 'T00:00:00Z';
+  const existingRes = await fetch(
+    `${SUPABASE_URL}/rest/v1/pricing_actions?status=eq.pending&created_at=gte.${sinceToday}&select=property_id,window_label`,
+    { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+  );
+  const existing = existingRes.ok ? await existingRes.json() : [];
+  const existingKey = new Set(existing.map(r => `${r.property_id}:${r.window_label}`));
+
+  const toInsert = [];
+  for (const prop of PROPERTIES) {
+    const alerts = computePropertyAlerts(prop, plData, alertData, bookings, todayStr);
+    const settings = alertData[prop.plId]?.settings;
+    const currentBase = settings?.base ?? null;
+
+    for (const a of alerts) {
+      if (a.level !== 'RED' && a.level !== 'YELLOW') continue;
+      if (existingKey.has(`${prop.id}:${a.window}`)) continue;
+
+      const reductionPct = a.level === 'RED' ? 0.15 : 0.10;
+      const recommendedBase = currentBase ? Math.round(currentBase * (1 - reductionPct)) : null;
+
+      toInsert.push({
+        property_id:            prop.id,
+        pricelabs_listing_id:   prop.plId,
+        window_label:           a.window,
+        alert_level:            a.level,
+        current_avg_price:      a.avgPrice,
+        recommended_base_price: recommendedBase,
+        market_median:          a.mktP50,
+        reason:                 a.action,
+        overpriced_dates:       a.overpricedDates,
+        status:                 'pending',
+      });
+    }
+  }
+
+  if (toInsert.length === 0) return 0;
+
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/pricing_actions`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal',
+    },
+    body: JSON.stringify(toInsert),
+  });
+  if (!res.ok) throw new Error(`pricing_actions insert ${res.status}: ${await res.text()}`);
+  return toInsert.length;
+}
+
 // Snapshot today's PriceLabs prices to Supabase for historical analysis.
 // Upserts on (property_id, date) — safe to run daily, overwrites with latest data.
 async function snapshotPriceLabsData(plData, capturedAt) {
@@ -571,6 +629,14 @@ function computePropertyAlerts(prop, plData, alertData, bookings, todayStr) {
       action = `Reduce base price in PriceLabs — avg price ${ptsAbove}% above market median. Adjust now to attract advance bookings.`;
     }
 
+    const overpricedDates = datesWithPrice
+      .filter(d => prices[d].price > (percentiles[d]?.p75 ?? avgP75))
+      .map(d => ({
+        date:  d,
+        price: Math.round(prices[d].price),
+        p75:   Math.round(percentiles[d]?.p75 ?? avgP75),
+      }));
+
     alerts.push({
       window: win.label, level: level || 'OK',
       avgPrice: Math.round(avgPrice),
@@ -579,6 +645,7 @@ function computePropertyAlerts(prop, plData, alertData, bookings, todayStr) {
       propOcc: propOcc != null ? Math.round(propOcc * 100) : null,
       mktOcc:  mktOcc  != null ? Math.round(mktOcc  * 100) : null,
       action,
+      overpricedDates,
     });
   }
 
@@ -2003,6 +2070,14 @@ async function main() {
     console.log('  Fetching pricing alert data (settings + market percentiles)...');
     try { alertData = await fetchPricingAlertData(); }
     catch (e) { console.warn('  Pricing alert fetch failed:', e.message); }
+  }
+
+  // Save RED/YELLOW alerts to pricing_actions for portal approval workflow
+  if (alertData && plData && !PREVIEW_OUT) {
+    try {
+      const n = await savePricingActions(plData, alertData, bookings, todayStr);
+      console.log(`  ✓ pricing_actions: ${n} new action(s) written`);
+    } catch (e) { console.warn('  pricing_actions write failed (non-fatal):', e.message); }
   }
 
   const hardcodedEvents = getHardcodedEvents(todayStr);

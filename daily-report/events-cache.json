@@ -1,6 +1,6 @@
 {
-  "last_updated": "2026-06-02T22:56:07.963Z",
-  "scan_date": "2026-06-02",
+  "last_updated": "2026-06-04T15:25:24.119Z",
+  "scan_date": "2026-06-04",
   "events": [
     {
       "id": "tm-1Av0ZbgGkT9cJBU",
@@ -3773,6 +3773,40 @@
       "source": "web-search",
       "notes": "Discovered via web search. Source: https://sowal.com/event/seabreeze-jazz-festival-5",
       "discovered_at": "2026-06-02T22:56:03.443Z"
+    },
+    {
+      "id": "tm-G5viZ_GC1VyK5",
+      "name": "NPC Knox Classic Prejudging",
+      "market": "Sevierville",
+      "start_date": "2026-08-01",
+      "end_date": "2026-08-01",
+      "impact": "moderate",
+      "is_watch": false,
+      "source": "ticketmaster",
+      "source_id": "G5viZ_GC1VyK5",
+      "category": "Sports — Body Building",
+      "venue": "Knoxville Civic Auditorium",
+      "venue_capacity": null,
+      "url": "https://www.ticketmaster.com/npc-knox-classic-prejudging-knoxville-tennessee-08-01-2026/event/1B0064C38AD394CB",
+      "notes": "",
+      "discovered_at": "2026-06-04T15:24:53.825Z"
+    },
+    {
+      "id": "tm-G5viZ_GCFxIHw",
+      "name": "NPC Knox Classic Finals",
+      "market": "Sevierville",
+      "start_date": "2026-08-01",
+      "end_date": "2026-08-01",
+      "impact": "moderate",
+      "is_watch": false,
+      "source": "ticketmaster",
+      "source_id": "G5viZ_GCFxIHw",
+      "category": "Sports — Body Building",
+      "venue": "Knoxville Civic Auditorium",
+      "venue_capacity": null,
+      "url": "https://www.ticketmaster.com/npc-knox-classic-finals-knoxville-tennessee-08-01-2026/event/1B0064C3888A8F32",
+      "notes": "",
+      "discovered_at": "2026-06-04T15:24:53.825Z"
     }
   ]
 }

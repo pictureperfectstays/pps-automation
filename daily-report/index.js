@@ -354,6 +354,8 @@ async function savePricingActions(plData, alertData, bookings, todayStr) {
         market_median:          a.mktP50,
         reason:                 a.action,
         overpriced_dates:       a.overpricedDates,
+        property_occ:           a.propOcc ?? null,
+        market_occ:             a.mktOcc  ?? null,
         status:                 'pending',
       });
     }

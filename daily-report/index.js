@@ -405,7 +405,7 @@ async function snapshotPriceLabsData(plData, capturedAt) {
   const CHUNK = 500;
   let upserted = 0;
   for (let i = 0; i < rows.length; i += CHUNK) {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/pricing_snapshots`, {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/pricing_snapshots?on_conflict=property_id,date`, {
       method: 'POST',
       headers: {
         apikey:         SUPABASE_KEY,

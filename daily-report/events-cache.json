@@ -1,75 +1,7 @@
 {
-  "last_updated": "2026-09-21T17:34:28.254Z",
-  "scan_date": "2026-09-21",
+  "last_updated": "2026-09-24T16:49:53.637Z",
+  "scan_date": "2026-09-24",
   "events": [
-    {
-      "id": "tm-17k8v0G61Rp96L3",
-      "name": "LUCKI",
-      "market": "Scottsdale",
-      "start_date": "2026-08-22",
-      "end_date": "2026-08-22",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "17k8v0G61Rp96L3",
-      "category": "Music — Hip-Hop/Rap",
-      "venue": "Marquee Theatre",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/lucki-tempe-arizona-08-22-2026/event/190064ABD65C77D2",
-      "notes": "",
-      "discovered_at": "2026-05-22T21:04:02.528Z"
-    },
-    {
-      "id": "tm-1A_ZkuyGkdo0k3A",
-      "name": "Mt. Joy 2026: Celebrating 10 Years Of Mt. Joy",
-      "market": "Scottsdale",
-      "start_date": "2026-08-22",
-      "end_date": "2026-08-22",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "1A_ZkuyGkdo0k3A",
-      "category": "Music — Folk",
-      "venue": "Arizona Financial Theatre",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/mt-joy-2026-celebrating-10-years-phoenix-arizona-08-22-2026/event/19006379D1906485",
-      "notes": "",
-      "discovered_at": "2026-05-22T21:04:02.528Z"
-    },
-    {
-      "id": "tm-1Av0Z_eGkwjK0am",
-      "name": "Tori Amos: In Times of Dragons Tour",
-      "market": "Scottsdale",
-      "start_date": "2026-08-23",
-      "end_date": "2026-08-23",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "1Av0Z_eGkwjK0am",
-      "category": "Music — Rock",
-      "venue": "Arizona Financial Theatre",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/tori-amos-in-times-of-dragons-phoenix-arizona-08-23-2026/event/1900642C9C4E426E",
-      "notes": "",
-      "discovered_at": "2026-05-22T21:04:02.529Z"
-    },
-    {
-      "id": "tm-1Av0Z_6GkTK4az3",
-      "name": "Hulvey - \"Could Be Tonight\" Tour",
-      "market": "Scottsdale",
-      "start_date": "2026-08-24",
-      "end_date": "2026-08-24",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "1Av0Z_6GkTK4az3",
-      "category": "Music — Hip-Hop/Rap",
-      "venue": "The Van Buren",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/hulvey-could-be-tonight-tour-phoenix-arizona-08-24-2026/event/1900647FD3549E12",
-      "notes": "",
-      "discovered_at": "2026-05-22T21:04:02.529Z"
-    },
     {
       "id": "tm-1kk8v04yGA5XUSy",
       "name": "Social Distortion",
@@ -1252,18 +1184,6 @@
       "discovered_at": "2026-06-02T22:55:56.591Z"
     },
     {
-      "id": "web-verify-smoky-mtn-songwriters-2026",
-      "name": "Smoky Mountain Songwriters Festival",
-      "market": "Sevierville",
-      "start_date": "2026-08-21",
-      "end_date": "2026-08-23",
-      "impact": "high",
-      "is_watch": false,
-      "source": "web-search",
-      "notes": "Dates verified via web search for 2026.",
-      "discovered_at": "2026-06-02T22:56:00.140Z"
-    },
-    {
       "id": "web-discover-seabreeze-jazz-festival-2027-04-21",
       "name": "Seabreeze Jazz Festival",
       "market": "Panama City Beach",
@@ -2128,23 +2048,6 @@
       "discovered_at": "2026-06-15T17:03:35.117Z"
     },
     {
-      "id": "tm-17k8v0G6GSgk5Py",
-      "name": "Molly Santana & North West - Kimokawaii Tour",
-      "market": "Scottsdale",
-      "start_date": "2026-08-23",
-      "end_date": "2026-08-23",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "17k8v0G6GSgk5Py",
-      "category": "Music — R&B",
-      "venue": "The Van Buren",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/molly-santana-north-west-kimokawaii-tour-phoenix-arizona-08-23-2026/event/190064CCF518B979",
-      "notes": "",
-      "discovered_at": "2026-06-18T15:35:28.782Z"
-    },
-    {
       "id": "tm-17k8v0G6GiNil4w",
       "name": "SiriusXM Presents: The Fantasy Footballers Megalashow ",
       "market": "Scottsdale",
@@ -2514,23 +2417,6 @@
       "discovered_at": "2026-06-22T16:41:47.911Z"
     },
     {
-      "id": "tm-17k8v0G6uhoObgR",
-      "name": "Linea Personal: TODO Ø NADA",
-      "market": "Scottsdale",
-      "start_date": "2026-08-22",
-      "end_date": "2026-08-22",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "17k8v0G6uhoObgR",
-      "category": "Music — Latin",
-      "venue": "The Van Buren",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/linea-personal-todo-nada-phoenix-arizona-08-22-2026/event/190064D6D1818D6F",
-      "notes": "",
-      "discovered_at": "2026-06-25T14:43:24.766Z"
-    },
-    {
       "id": "tm-17k8v0G6uFwvH-t",
       "name": "Brandon Flowers",
       "market": "Scottsdale",
@@ -2711,18 +2597,6 @@
       "url": "https://www.ticketmaster.com/dinosaur-jr-tempe-arizona-10-10-2026/event/190064D993564C71",
       "notes": "",
       "discovered_at": "2026-07-02T14:15:09.988Z"
-    },
-    {
-      "id": "web-discover-full-music-festival-lineup-2026-2026-08-21",
-      "name": "Full Music Festival Lineup 2026",
-      "market": "Sevierville",
-      "start_date": "2026-08-21",
-      "end_date": "2026-08-23",
-      "impact": "high",
-      "is_watch": false,
-      "source": "web-search",
-      "notes": "Discovered via web search. Source: https://themountainusa.com/artists/full-lineup",
-      "discovered_at": "2026-07-02T14:15:43.281Z"
     },
     {
       "id": "tm-17k8v0G6CKP5JeZ",
@@ -3827,21 +3701,6 @@
       "url": "https://www.ticketmaster.com/alvaro-diaz-omakase-tour-phoenix-arizona-11-02-2026/event/190064C3C5809E7F",
       "notes": "",
       "discovered_at": "2026-08-06T14:21:48.250Z"
-    },
-    {
-      "id": "espn-football-nfl-401874101",
-      "name": "Arizona Cardinals vs Dallas Cowboys",
-      "market": "Scottsdale",
-      "start_date": "2026-08-23",
-      "end_date": "2026-08-23",
-      "impact": "high",
-      "is_watch": false,
-      "source": "espn",
-      "source_id": "401874101",
-      "category": "Sports — Football",
-      "venue": "State Farm Stadium",
-      "notes": "Home game at State Farm Stadium, Glendale",
-      "discovered_at": "2026-08-06T14:21:49.149Z"
     },
     {
       "id": "web-discover-pirates-of-the-high-seas-renaissance-fes-2026-10-09",
@@ -6508,6 +6367,40 @@
       "url": "https://www.ticketmaster.com/knoxville-ice-bears-exhibition-game-knoxville-tennessee-10-09-2026/event/1B006529B0EBD9BF",
       "notes": "",
       "discovered_at": "2026-09-21T17:33:49.200Z"
+    },
+    {
+      "id": "tm-1kk8vPk6GAurKPK",
+      "name": "NLDS Home Game 1",
+      "market": "Scottsdale",
+      "start_date": "2026-10-06",
+      "end_date": "2026-10-06",
+      "impact": "high",
+      "is_watch": false,
+      "source": "ticketmaster",
+      "source_id": "1kk8vPk6GAurKPK",
+      "category": "Sports — Baseball",
+      "venue": "Chase Field",
+      "venue_capacity": null,
+      "url": "https://www.ticketmaster.com/nlds-home-game-1-phoenix-arizona-10-06-2026/event/190065187D793953",
+      "notes": "",
+      "discovered_at": "2026-09-24T16:49:04.055Z"
+    },
+    {
+      "id": "tm-1kk8vPk6GAuOdPJ",
+      "name": "NLDS Home Game 2",
+      "market": "Scottsdale",
+      "start_date": "2026-10-07",
+      "end_date": "2026-10-07",
+      "impact": "high",
+      "is_watch": false,
+      "source": "ticketmaster",
+      "source_id": "1kk8vPk6GAuOdPJ",
+      "category": "Sports — Baseball",
+      "venue": "Chase Field",
+      "venue_capacity": null,
+      "url": "https://www.ticketmaster.com/nlds-home-game-2-phoenix-arizona-10-07-2026/event/190065187D803966",
+      "notes": "",
+      "discovered_at": "2026-09-24T16:49:04.055Z"
     }
   ]
 }

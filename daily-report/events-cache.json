@@ -1,58 +1,7 @@
 {
-  "last_updated": "2026-09-28T19:02:55.278Z",
-  "scan_date": "2026-09-28",
+  "last_updated": "2026-10-01T18:15:23.910Z",
+  "scan_date": "2026-10-01",
   "events": [
-    {
-      "id": "tm-Z7r9jZ1A7xfr7",
-      "name": "KAROL G - VIAJANDO POR EL MUNDO TROPITOUR",
-      "market": "Scottsdale",
-      "start_date": "2026-08-29",
-      "end_date": "2026-08-29",
-      "impact": "high",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "Z7r9jZ1A7xfr7",
-      "category": "Music — Other",
-      "venue": "State Farm Stadium",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/event/Z7r9jZ1A7xfr7",
-      "notes": "",
-      "discovered_at": "2026-05-22T21:04:02.529Z"
-    },
-    {
-      "id": "tm-1kk8vN06GA17KvS",
-      "name": "2026 REGULAR SEASON - vs Indy Eleven",
-      "market": "Scottsdale",
-      "start_date": "2026-08-29",
-      "end_date": "2026-08-29",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "1kk8vN06GA17KvS",
-      "category": "Sports — Soccer",
-      "venue": "Phoenix Rising Stadium",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/2026-regular-season-vs-indy-eleven-phoenix-arizona-08-29-2026/event/190063907A113073",
-      "notes": "",
-      "discovered_at": "2026-05-22T21:04:02.529Z"
-    },
-    {
-      "id": "tm-17k8v0G615RZyU7",
-      "name": "Channel Tres - The Enigma Tour",
-      "market": "Scottsdale",
-      "start_date": "2026-08-29",
-      "end_date": "2026-08-29",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "17k8v0G615RZyU7",
-      "category": "Music — Pop",
-      "venue": "The Van Buren",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/channel-tres-the-enigma-tour-phoenix-arizona-08-29-2026/event/190064A2EF039D84",
-      "notes": "",
-      "discovered_at": "2026-05-22T21:04:02.529Z"
-    },
     {
       "id": "tm-1A_ZkofGkdqzrKj",
       "name": "Kamelot - Dark Asylum World Tour",
@@ -154,23 +103,6 @@
       "url": "https://www.ticketmaster.com/shaboozey-outlaws-never-die-tour-phoenix-arizona-09-08-2026/event/19006498C390B24C",
       "notes": "",
       "discovered_at": "2026-05-22T21:04:02.533Z"
-    },
-    {
-      "id": "tm-G5viZ_6E1rasH",
-      "name": "Nitro Circus 2.0",
-      "market": "Sevierville",
-      "start_date": "2026-08-29",
-      "end_date": "2026-08-29",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "G5viZ_6E1rasH",
-      "category": "Sports — Motorsports/Racing",
-      "venue": "Covenant Health Park",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/nitro-circus-20-knoxville-tennessee-08-29-2026/event/1B006479CA789C7C",
-      "notes": "",
-      "discovered_at": "2026-05-22T21:03:57.218Z"
     },
     {
       "id": "espn-football-nfl-401872943",
@@ -306,23 +238,6 @@
       "venue": "State Farm Stadium",
       "notes": "Home game at State Farm Stadium, Glendale",
       "discovered_at": "2026-05-22T21:04:03.696Z"
-    },
-    {
-      "id": "tm-17k8v0G6537WfxQ",
-      "name": "2026 STREET LEAGUE SKATEBOARDING - TEMPE TAKEOVER",
-      "market": "Scottsdale",
-      "start_date": "2026-08-29",
-      "end_date": "2026-08-29",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "17k8v0G6537WfxQ",
-      "category": "Sports — Extreme",
-      "venue": "Mullett Arena ",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/2026-street-league-skateboarding-tempe-takeover-tempe-arizona-08-29-2026/event/190064B484F5489A",
-      "notes": "",
-      "discovered_at": "2026-06-02T20:41:40.335Z"
     },
     {
       "id": "tm-Z7r9jZ1A7x6og",
@@ -2674,23 +2589,6 @@
       "discovered_at": "2026-07-20T13:51:59.493Z"
     },
     {
-      "id": "tm-17k8v0G6CNkf6F1",
-      "name": "It's A 2000's Party",
-      "market": "Scottsdale",
-      "start_date": "2026-08-29",
-      "end_date": "2026-08-29",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "17k8v0G6CNkf6F1",
-      "category": "Music — Dance/Electronic",
-      "venue": "Marquee Theatre",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/its-a-2000s-party-tempe-arizona-08-29-2026/event/190064E8C650720A",
-      "notes": "",
-      "discovered_at": "2026-07-23T14:10:16.486Z"
-    },
-    {
       "id": "tm-17k8v0G6CJRFp7P",
       "name": "Punchis Punchis: Banda Rave Experience",
       "market": "Scottsdale",
@@ -3264,40 +3162,6 @@
       "url": "https://www.ticketmaster.com/skillet-comatose-20-years-still-screaming-phoenix-arizona-11-01-2026/event/190064D1A5826B34",
       "notes": "",
       "discovered_at": "2026-08-03T14:21:15.025Z"
-    },
-    {
-      "id": "tm-G5viZ_2UKDbxL",
-      "name": "Tennessee Volunteers Volleyball vs. Morehead State Eagles Women's Volleyball",
-      "market": "Sevierville",
-      "start_date": "2026-08-29",
-      "end_date": "2026-08-29",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "G5viZ_2UKDbxL",
-      "category": "Sports — Volleyball",
-      "venue": "Food City Center",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/tennessee-volunteers-volleyball-vs-morehead-state-knoxville-tennessee-08-29-2026/event/1B0064FD93ED889F",
-      "notes": "",
-      "discovered_at": "2026-08-03T14:21:10.946Z"
-    },
-    {
-      "id": "tm-G5viZ_2UKBFx8",
-      "name": "Tennessee Volunteers Volleyball vs. Fairfield Womens Volleyball",
-      "market": "Sevierville",
-      "start_date": "2026-08-29",
-      "end_date": "2026-08-29",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "G5viZ_2UKBFx8",
-      "category": "Sports — Volleyball",
-      "venue": "Food City Center",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/tennessee-volunteers-volleyball-vs-fairfield-womens-knoxville-tennessee-08-29-2026/event/1B0064FD93E88890",
-      "notes": "",
-      "discovered_at": "2026-08-03T14:21:10.946Z"
     },
     {
       "id": "tm-G5viZ_2UKHIxm",
@@ -6447,6 +6311,23 @@
       "source": "web-search",
       "notes": "Discovered via web search. Source: https://destinmiramar.com/events/gulf-coast-jam-2027",
       "discovered_at": "2026-09-28T19:02:46.633Z"
+    },
+    {
+      "id": "tm-17k8v0G6ukpX4Cc",
+      "name": "Sun Devil Hockey v Western Michigan University",
+      "market": "Scottsdale",
+      "start_date": "2026-12-12",
+      "end_date": "2026-12-12",
+      "impact": "moderate",
+      "is_watch": false,
+      "source": "ticketmaster",
+      "source_id": "17k8v0G6ukpX4Cc",
+      "category": "Sports — Hockey",
+      "venue": "Mullett Arena ",
+      "venue_capacity": null,
+      "url": "https://www.ticketmaster.com/sun-devil-hockey-v-western-michigan-tempe-arizona-12-12-2026/event/190064D196F953AD",
+      "notes": "",
+      "discovered_at": "2026-10-01T18:14:46.771Z"
     }
   ]
 }

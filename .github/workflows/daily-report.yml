@@ -4,7 +4,17 @@ on:
   schedule:
     # 7am AZ (MST = UTC-7, no DST)
     - cron: '0 14 * * *'
-  workflow_dispatch:        # Allow manual trigger from GitHub UI
+  workflow_dispatch:        # Manual trigger from GitHub UI, and the Supabase pg_cron dispatch
+    inputs:
+      force:
+        description: 'Send even if a report was already sent today from this branch'
+        type: boolean
+        default: false
+
+# Never run two reports at once (the "already sent today" check relies on it)
+concurrency:
+  group: daily-report-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   report:
@@ -31,5 +41,6 @@ jobs:
           PRICELABS_API_KEY: ${{ secrets.PRICELABS_API_KEY }}
           TICKETMASTER_API_KEY: ${{ secrets.TICKETMASTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FORCE_SEND: ${{ inputs.force }}
         run: node index.js
         working-directory: daily-report

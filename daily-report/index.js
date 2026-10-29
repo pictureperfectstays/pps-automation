@@ -8,7 +8,7 @@ import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
-import { getHardcodedEvents, PROP_MARKET } from './events-calendar.js';
+import { getHardcodedEvents, MARKETS } from './events-calendar.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ─── Credentials ─────────────────────────────────────────────────────────────
@@ -36,7 +36,14 @@ const SUPABASE_KEY = ENV.SUPABASE_SERVICE_KEY;
 const RESEND_KEY = ENV.RESEND_API_KEY;
 const PRICELABS_KEY = ENV.PRICELABS_API_KEY;
 const ANTHROPIC_KEY = ENV.ANTHROPIC_API_KEY;
-const PL_DATA_FILE = ENV.PRICELABS_DATA_FILE; // fallback: load from file if set
+const PL_DATA_FILE = ENV.PRICELABS_DATA_FILE; // fallback: load from file if set (local runs only)
+const IS_CI = ENV.GITHUB_ACTIONS === 'true';
+// Run log identity: GITHUB_REF is e.g. refs/heads/main; local runs log as 'local'
+const GIT_REF       = ENV.GITHUB_REF || 'local';
+const TRIGGER_EVENT = ENV.GITHUB_EVENT_NAME || 'local';
+const GITHUB_RUN_ID = ENV.GITHUB_RUN_ID || null;
+const FORCE_SEND    = ENV.FORCE_SEND === 'true'; // workflow_dispatch input "force"
+const MAIN_REF      = 'refs/heads/main';
 
 if (!SUPABASE_URL || !SUPABASE_KEY) { console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY'); process.exit(1); }
 if (!RESEND_KEY) { console.error('Missing RESEND_API_KEY'); process.exit(1); }
@@ -50,14 +57,15 @@ const INSTAGRAM_ICON_URL = 'https://vzozyzkaovegwfdmbcxg.supabase.co/storage/v1/
 const WEBSITE_URL = 'https://www.staypictureperfect.com';
 const INSTAGRAM_URL = 'https://www.instagram.com/pictureperfectstays';
 
-// targetPct: the market percentile this property targets
-// Emerald Views targets p75-p90 (premium 1BR with 2BA)
-const PROPERTIES = [
-  { id: 5,  plId: '471179', name: 'Emerald Views',      location: 'Panama City Beach, FL', minPrice: 105, targetPct: 75, color: '#668CB3' },
-  { id: 6,  plId: '471178', name: 'Enchanted Getaway',  location: 'Sevierville, TN',        minPrice: null, targetPct: 50, color: '#D96666' },
-  { id: 7,  plId: '471181', name: 'Musical Oasis',      location: 'Scottsdale, AZ',         minPrice: 90,  targetPct: 50, color: '#737373' },
-  { id: 8,  plId: '471180', name: 'Travelers Paradise', location: 'Scottsdale, AZ',         minPrice: 100, targetPct: 50, color: '#65AD89' },
-];
+// Live properties, loaded from Supabase at the start of main() by loadProperties().
+// Each: { id, plId, name, fullName, city, state, location, market, owned, color,
+//         targetLowPct, targetHighPct }
+let PROPERTIES = [];
+
+// Badge colors: the original four keep theirs; any other property takes the
+// next palette color in ID order.
+const PROPERTY_COLOR = { 5: '#668CB3', 6: '#D96666', 7: '#737373', 8: '#65AD89' };
+const EXTRA_COLORS   = ['#8E6BB8', '#C98A3D', '#3D9CA8', '#B8607E', '#6B8E3D'];
 
 // Channel host fees (deducted from your payout)
 // Airbnb: 15.5% host-only fee
@@ -79,7 +87,9 @@ const channelNet = (price, ch) => Math.round(price * (1 - channelFee(ch)));
 
 const addDays = (d, n) => { const x = new Date(d + 'T00:00:00Z'); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
 const diffDays = (a, b) => Math.round((new Date(b + 'T00:00:00Z') - new Date(a + 'T00:00:00Z')) / 86400000);
-const today = () => new Date().toISOString().slice(0, 10);
+// "Today" is always the Arizona date (America/Phoenix, no DST), never the UTC date
+const today = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Phoenix' }).format(new Date());
+const AZ_OFFSET = '-07:00'; // Arizona midnight as a timestamp: `${date}T00:00:00${AZ_OFFSET}`
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const DAYS   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 const fmtDate  = d => { const [,m,day] = d.split('-'); return `${MONTHS[+m-1]} ${+day}`; };
@@ -138,12 +148,162 @@ async function sb(path) {
   return r.json();
 }
 
+// Page through a Supabase read until done (PostgREST caps responses at 1000 rows)
+async function sbAll(path) {
+  const PAGE = 1000;
+  const rows = [];
+  for (let offset = 0; ; offset += PAGE) {
+    const page = await sb(`${path}&limit=${PAGE}&offset=${offset}`);
+    rows.push(...page);
+    if (page.length < PAGE) return rows;
+  }
+}
+
+async function sbWrite(method, path, body, prefer = 'return=minimal') {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    method,
+    headers: {
+      apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'application/json', Prefer: prefer,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`Supabase ${method} ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  return prefer.includes('representation') ? r.json() : null;
+}
+
+// ─── Run Status ───────────────────────────────────────────────────────────────
+// failures: a step failed or returned partial data. Shown in the banner at the
+// top of the email; the run then exits 1 after sending, so the workflow goes red.
+// warnings: worth knowing but not a failure (e.g. yesterday's report missing).
+// Shown in the same banner; they don't change the exit code.
+
+const failures = [];
+const warnings = [];
+// Exact repeats are dropped (some checks run once per section that uses the data)
+function recordFailure(step, detail) {
+  detail = String(detail).slice(0, 300);
+  if (failures.some(f => f.step === step && f.detail === detail)) return;
+  failures.push({ step, detail });
+  console.warn(`  ✗ FAILED: ${step}: ${detail}`);
+}
+function recordWarning(step, detail) {
+  detail = String(detail).slice(0, 300);
+  if (warnings.some(w => w.step === step && w.detail === detail)) return;
+  warnings.push({ step, detail });
+  console.warn(`  ⚠ ${step}: ${detail}`);
+}
+
+// Run a data step; on error record the failure and return null so the
+// section that needs it can say the data is unavailable.
+async function step(name, fn) {
+  try { return await fn(); }
+  catch (e) { recordFailure(name, e.message); return null; }
+}
+
+// ─── Properties ───────────────────────────────────────────────────────────────
+
+// Market for a property, from its city (events and seasonality notes are per market)
+const marketForCity = city => Object.values(MARKETS).find(m => m.toLowerCase() === (city || '').trim().toLowerCase()) || null;
+
+// Live properties: same rule as the portal (onboarding_status 'live', active,
+// OwnerRez ID set). Owned vs. Managed mirrors the portal's rule in
+// picture-perfect-stays-portal/admin-users.html:809-818: a property is Owned
+// when an admin account is linked to it in property_owners, otherwise Managed.
+async function loadProperties() {
+  const rows = await sb(
+    'properties?select=id,name,report_short_name,city,state,pricelabs_listing_id,'
+    + 'price_target_low_pct,price_target_high_pct,property_owners(owners(is_admin))'
+    + '&onboarding_status=eq.live&is_active=eq.true&ownerrez_property_id=not.is.null&order=id'
+  );
+  let extra = 0;
+  const props = rows.map(r => ({
+    id:            r.id,
+    plId:          r.pricelabs_listing_id ? String(r.pricelabs_listing_id) : null,
+    name:          r.report_short_name || r.name,
+    fullName:      r.name,
+    city:          r.city,
+    state:         r.state,
+    location:      [r.city, r.state].filter(Boolean).join(', '),
+    market:        marketForCity(r.city),
+    owned:         (r.property_owners || []).some(po => po.owners?.is_admin),
+    color:         PROPERTY_COLOR[r.id] || EXTRA_COLORS[extra++ % EXTRA_COLORS.length],
+    targetLowPct:  r.price_target_low_pct,
+    targetHighPct: r.price_target_high_pct,
+  }));
+  // Owned first, then Managed; ID order within each group
+  props.sort((a, b) => (b.owned - a.owned) || (a.id - b.id));
+  return props;
+}
+
+const propIdList = () => PROPERTIES.map(p => p.id).join(',');
+const plProps    = () => PROPERTIES.filter(p => p.plId);
+const groupLabel = p => p.owned ? 'Owned' : 'Managed';
+
+// Owned / Managed sub-header row for a property table: returns the header
+// when `prop` starts a new group, otherwise ''.
+function groupRow(prop, index, colspan) {
+  if (index > 0 && PROPERTIES[index - 1]?.owned === prop.owned) return '';
+  return `<tr><td colspan="${colspan}" style="padding:10px 12px 4px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.04em;">${groupLabel(prop)}</td></tr>`;
+}
+// Same for per-property blocks (div layout)
+function groupHeading(prop, index) {
+  if (index > 0 && PROPERTIES[index - 1]?.owned === prop.owned) return '';
+  return `<div style="margin:${index > 0 ? '18px' : '0'} 0 10px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.04em;">${groupLabel(prop)}</div>`;
+}
+
+// ─── Run Log (daily_report_runs) ──────────────────────────────────────────────
+
+// True if a report for this date was already sent from the same git ref.
+// On main this covers the Supabase dispatch and the 9 AM backup schedule;
+// a branch test run only ever matches its own branch's earlier runs.
+async function alreadySentToday(todayStr) {
+  const rows = await sb(
+    `daily_report_runs?select=id&git_ref=eq.${encodeURIComponent(GIT_REF)}&report_date=eq.${todayStr}`
+    + `&status=in.(sent,sent_with_failures)&limit=1`
+  );
+  return rows.length > 0;
+}
+
+async function startRunLog(todayStr, status) {
+  const [row] = await sbWrite('POST', 'daily_report_runs', {
+    report_date: todayStr, git_ref: GIT_REF, trigger_event: TRIGGER_EVENT,
+    forced: FORCE_SEND, status, github_run_id: GITHUB_RUN_ID,
+    ...(status === 'skipped' ? { finished_at: new Date().toISOString() } : {}),
+  }, 'return=representation');
+  return row.id;
+}
+
+async function finishRunLog(runId, status, resendId) {
+  if (!runId) return;
+  await sbWrite('PATCH', `daily_report_runs?id=eq.${runId}`, {
+    status, finished_at: new Date().toISOString(),
+    failures: [...failures, ...warnings.map(w => ({ ...w, warning: true }))],
+    resend_id: resendId || null,
+  });
+}
+
+// "Yesterday's report didn't run": no sent row on main for yesterday. A row
+// still 'running' counts as not run. Checked on main runs only, and only once
+// main has logged any earlier run (so the first day after cutover doesn't warn).
+async function checkYesterdaySent(todayStr) {
+  if (GIT_REF !== MAIN_REF) return;
+  const yesterday = addDays(todayStr, -1);
+  const [anyEarlier, sentYesterday] = await Promise.all([
+    sb(`daily_report_runs?select=id&git_ref=eq.${encodeURIComponent(MAIN_REF)}&report_date=lt.${todayStr}&limit=1`),
+    sb(`daily_report_runs?select=id&git_ref=eq.${encodeURIComponent(MAIN_REF)}&report_date=eq.${yesterday}&status=in.(sent,sent_with_failures)&limit=1`),
+  ]);
+  if (anyEarlier.length && !sentYesterday.length) {
+    recordWarning('Yesterday\'s report', `No report was sent for ${fmtDateL(yesterday)}. Check the GitHub Actions run history and the Supabase daily-report-dispatch job.`);
+  }
+}
+
 // ─── Data Fetching ────────────────────────────────────────────────────────────
 
 async function fetchBookings90(fromDate, toDate) {
   return sb(
     `bookings?select=id,property_id,guest_display_name,arrival_date,departure_date,nights,gross_revenue,net_revenue,booking_channel,booked_at,charges_json`
-    + `&status=in.(active,blocked)&arrival_date=lt.${toDate}&departure_date=gt.${fromDate}`
+    + `&property_id=in.(${propIdList()})&status=in.(active,blocked)&arrival_date=lt.${toDate}&departure_date=gt.${fromDate}`
     + `&order=arrival_date.asc`
   );
 }
@@ -160,9 +320,10 @@ function rentPerNight(booking) {
 
 async function fetchRecentActivity() {
   const since = new Date(Date.now() - 25 * 3600 * 1000).toISOString();
+  const ids = propIdList();
   const [newBookings, cancellations] = await Promise.all([
-    sb(`bookings?select=id,property_id,guest_display_name,arrival_date,departure_date,nights,gross_revenue,booking_channel,booked_at&status=eq.active&booked_at=gte.${since}&order=booked_at.desc`),
-    sb(`bookings?select=id,property_id,guest_display_name,arrival_date,departure_date,nights,gross_revenue,booking_channel,updated_at&status=eq.canceled&updated_at=gte.${since}&order=updated_at.desc`),
+    sb(`bookings?select=id,property_id,guest_display_name,arrival_date,departure_date,nights,gross_revenue,booking_channel,booked_at&property_id=in.(${ids})&status=eq.active&booked_at=gte.${since}&order=booked_at.desc`),
+    sb(`bookings?select=id,property_id,guest_display_name,arrival_date,departure_date,nights,gross_revenue,booking_channel,updated_at&property_id=in.(${ids})&status=eq.canceled&updated_at=gte.${since}&order=updated_at.desc`),
   ]);
   return { newBookings, cancellations };
 }
@@ -171,9 +332,10 @@ async function fetchMTDRevenue(todayStr) {
   const thisStart = isoMonthStart(todayStr);
   const lyToday   = addDays(todayStr, -365);
   const lyStart   = isoMonthStart(lyToday);
+  const ids       = propIdList();
   const [cur, ly] = await Promise.all([
-    sb(`bookings?select=property_id,gross_revenue,net_revenue,nights&status=eq.active&arrival_date=gte.${thisStart}&arrival_date=lte.${todayStr}`),
-    sb(`bookings?select=property_id,gross_revenue,net_revenue,nights&status=eq.active&arrival_date=gte.${lyStart}&arrival_date=lte.${lyToday}`),
+    sb(`bookings?select=property_id,gross_revenue,net_revenue,nights&property_id=in.(${ids})&status=eq.active&arrival_date=gte.${thisStart}&arrival_date=lte.${todayStr}`),
+    sb(`bookings?select=property_id,gross_revenue,net_revenue,nights&property_id=in.(${ids})&status=eq.active&arrival_date=gte.${lyStart}&arrival_date=lte.${lyToday}`),
   ]);
   return { cur, ly, thisStart, lyStart };
 }
@@ -185,9 +347,10 @@ async function fetchBookingPaceData(paceMonths, todayStr) {
   const lastTYEnd    = paceMonths[paceMonths.length - 1].end;
   const firstLYStart = paceMonths[0].lyStart;
   const lastLYEnd    = paceMonths[paceMonths.length - 1].lyEnd;
+  const ids          = propIdList();
   const [tyBookings, lyBookings] = await Promise.all([
-    sb(`bookings?select=property_id,arrival_date,departure_date,nights,gross_revenue&status=eq.active&arrival_date=lt.${lastTYEnd}&departure_date=gt.${firstTYStart}&order=arrival_date.asc`),
-    sb(`bookings?select=property_id,arrival_date,departure_date,nights,gross_revenue&status=eq.active&booked_at=lte.${lySnapshot}&arrival_date=lt.${lastLYEnd}&departure_date=gt.${firstLYStart}&order=arrival_date.asc`),
+    sb(`bookings?select=property_id,arrival_date,departure_date,nights,gross_revenue&property_id=in.(${ids})&status=eq.active&arrival_date=lt.${lastTYEnd}&departure_date=gt.${firstTYStart}&order=arrival_date.asc`),
+    sb(`bookings?select=property_id,arrival_date,departure_date,nights,gross_revenue&property_id=in.(${ids})&status=eq.active&booked_at=lte.${lySnapshot}&arrival_date=lt.${lastLYEnd}&departure_date=gt.${firstLYStart}&order=arrival_date.asc`),
   ]);
   return { tyBookings, lyBookings };
 }
@@ -197,38 +360,82 @@ async function fetchRevenueForecastData(paceMonths, todayStr) {
   const lastEnd          = paceMonths[paceMonths.length - 1].end;
   const currentYearStart = `${todayStr.slice(0, 4)}-01-01`;
 
+  const ids              = propIdList();
+
   // Fetch in parallel: current-year blocks for forecast months + all historical active/blocked
-  const [tyBlocked, histPage1, histPage2, histBlocked] = await Promise.all([
-    sb(`bookings?select=property_id,arrival_date,departure_date&status=eq.blocked&arrival_date=lt.${lastEnd}&departure_date=gt.${firstStart}&order=arrival_date.asc`),
-    sb(`bookings?select=property_id,arrival_date,departure_date,gross_revenue,booked_at&status=eq.active&arrival_date=lt.${currentYearStart}&order=arrival_date.asc&limit=1000&offset=0`),
-    sb(`bookings?select=property_id,arrival_date,departure_date,gross_revenue,booked_at&status=eq.active&arrival_date=lt.${currentYearStart}&order=arrival_date.asc&limit=1000&offset=1000`),
-    sb(`bookings?select=property_id,arrival_date,departure_date&status=eq.blocked&arrival_date=lt.${currentYearStart}&order=arrival_date.asc`),
+  // (history paged until complete — no row cap)
+  const [tyBlocked, histActive, histBlocked] = await Promise.all([
+    sbAll(`bookings?select=property_id,arrival_date,departure_date&property_id=in.(${ids})&status=eq.blocked&arrival_date=lt.${lastEnd}&departure_date=gt.${firstStart}&order=arrival_date.asc,id.asc`),
+    sbAll(`bookings?select=property_id,arrival_date,departure_date,gross_revenue,booked_at&property_id=in.(${ids})&status=eq.active&arrival_date=lt.${currentYearStart}&order=arrival_date.asc,id.asc`),
+    sbAll(`bookings?select=property_id,arrival_date,departure_date&property_id=in.(${ids})&status=eq.blocked&arrival_date=lt.${currentYearStart}&order=arrival_date.asc,id.asc`),
   ]);
 
-  return { tyBlocked, histActive: [...histPage1, ...histPage2], histBlocked };
+  return { tyBlocked, histActive, histBlocked };
 }
 
-// ─── Tax Rules ────────────────────────────────────────────────────────────────
+// ─── Tax Profiles ─────────────────────────────────────────────────────────────
 
-async function fetchTaxRates() {
-  // Returns { 5: 0.13, 6: 0.1275, 7: 0.1402, 8: 0.1402 }
-  const rows = await sb('tax_rules?is_active=eq.true&select=property_id,rate');
-  const totals = {};
+// Each property's confirmed tax profile, same query as the portal
+// (picture-perfect-stays-portal/api/get-bookings.js:96-97).
+// Returns { [propertyId]: [{ name, rates: [{ rate, from }] }] } — active taxes only,
+// rates sorted by effective_from.
+async function fetchTaxProfiles() {
+  const rows = await sb(
+    `property_tax_profiles?status=eq.confirmed&property_id=in.(${propIdList()})`
+    + `&select=property_id,tax_profiles(id,display_name,tax_profile_taxes(id,ownerrez_name,is_active,tax_rate_history(rate_percent,effective_from)))`
+  );
+  const byProp = {};
   for (const row of rows) {
-    totals[row.property_id] = (totals[row.property_id] || 0) + Number(row.rate) / 100;
+    const taxes = row.tax_profiles?.tax_profile_taxes || [];
+    byProp[row.property_id] = taxes.filter(t => t.is_active).map(t => ({
+      name:  t.ownerrez_name,
+      rates: (t.tax_rate_history || [])
+        .map(r => ({ rate: Number(r.rate_percent), from: r.effective_from }))
+        .sort((a, b) => (a.from || '').localeCompare(b.from || '')),
+    }));
   }
-  return totals;
+  for (const p of PROPERTIES) {
+    if (!byProp[p.id]) recordFailure('Tax profile', `${p.name} has no confirmed tax profile; gap night "Guest Pays" can't include tax.`);
+  }
+  return byProp;
+}
+
+// Total tax rate (decimal, e.g. 0.1397) in effect on `date` for a property:
+// each active tax uses its latest rate with effective_from on or before the
+// date, the same rule as the portal (get-bookings.js:113-116). The guest pays
+// the full rate; exclusions only change who remits. null = no tax profile.
+function taxRateOn(taxProfiles, propId, date) {
+  const taxes = taxProfiles?.[propId];
+  if (!taxes) return null;
+  let total = 0;
+  for (const t of taxes) {
+    const current = t.rates.filter(r => !r.from || r.from <= date).pop();
+    if (current) total += current.rate;
+  }
+  return total / 100;
 }
 
 // ─── Events Cache ─────────────────────────────────────────────────────────────
 
-function fetchEventsCache() {
+// The Event Discovery Scan (scan-events.yml) refreshes the cache Mon and Thu,
+// so it should never be more than 4 days old; 6 allows one missed scan.
+const EVENTS_CACHE_MAX_AGE_DAYS = 6;
+
+function fetchEventsCache(todayStr) {
   try {
     const cachePath = join(__dirname, 'events-cache.json');
-    if (!existsSync(cachePath)) return [];
+    if (!existsSync(cachePath)) {
+      recordFailure('Events cache', 'events-cache.json is missing; only hard-coded events are shown.');
+      return [];
+    }
     const data = JSON.parse(readFileSync(cachePath, 'utf8'));
+    const scanDate = data.scan_date || data.last_updated?.slice(0, 10);
+    if (!scanDate || diffDays(scanDate, todayStr) > EVENTS_CACHE_MAX_AGE_DAYS) {
+      recordWarning('Events cache', `Last event scan was ${scanDate ? fmtDate(scanDate) : 'never'}; Ticketmaster and ESPN events may be out of date. Check the Event Discovery Scan workflow.`);
+    }
     return data.events || [];
-  } catch {
+  } catch (e) {
+    recordFailure('Events cache', `events-cache.json could not be read (${e.message}); only hard-coded events are shown.`);
     return [];
   }
 }
@@ -237,7 +444,7 @@ function fetchEventsCache() {
 // Uses proration — counts only nights and revenue within the event dates.
 // Returns { adr, nights, years } or null if insufficient data.
 function computeEventADR(event, histActive, propId) {
-  const currentYear = parseInt(today().slice(0, 4));
+  const currentYear = parseInt(today().slice(0, 4)); // Arizona year
   const eventMonth  = event.start_date.slice(5, 7); // MM
   const eventDay    = event.start_date.slice(8, 10); // DD
   const eventMonthE = event.end_date.slice(5, 7);
@@ -283,19 +490,27 @@ function computeEventADR(event, histActive, propId) {
 // Fetch prices from PriceLabs REST API for all 4 properties
 // Returns plData in format: { "471179": { "YYYY-MM-DD": { price, user_price, demand_desc, min_stay, unbookable, booking_status } } }
 async function fetchPriceLabsData(fromDate, toDate) {
-  if (!PRICELABS_KEY) return null;
-  const listings = PROPERTIES.map(p => ({ id: p.plId, pms: 'ownerrez', dateFrom: fromDate, dateTo: toDate }));
+  if (!PRICELABS_KEY) { recordFailure('PriceLabs prices', 'PRICELABS_API_KEY is not set.'); return null; }
+  const listings = plProps().map(p => ({ id: p.plId, pms: 'ownerrez', dateFrom: fromDate, dateTo: toDate }));
+  if (!listings.length) return null;
   const res = await fetch('https://api.pricelabs.co/v1/listing_prices', {
     method: 'POST',
     headers: { 'X-API-Key': PRICELABS_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({ listings }),
   });
-  if (!res.ok) { console.warn('PriceLabs API error:', res.status, await res.text()); return null; }
+  if (!res.ok) {
+    recordFailure('PriceLabs prices', `listing_prices returned HTTP ${res.status}: ${(await res.text()).slice(0, 150)}`);
+    return null;
+  }
   const raw = await res.json();
   // Transform: array of { id, data: [...] } → { plId: { date: priceObj } }
   const plData = {};
   for (const listing of (Array.isArray(raw) ? raw : (raw.listings || []))) {
-    if (listing.error) { console.warn(`PriceLabs ${listing.id}: ${listing.error_status}`); continue; }
+    if (listing.error) {
+      const prop = PROPERTIES.find(p => p.plId === String(listing.id));
+      recordFailure('PriceLabs prices', `${prop?.name ?? listing.id}: ${listing.error_status || listing.error}`);
+      continue;
+    }
     plData[listing.id] = {};
     for (const row of (listing.data || listing.prices || [])) {
       // Store ALL dates — sectionPrices filters to open dates via Supabase bookings;
@@ -307,12 +522,24 @@ async function fetchPriceLabsData(fromDate, toDate) {
       };
     }
   }
+  for (const p of plProps()) {
+    if (plData[p.plId] && !Object.keys(plData[p.plId]).length) {
+      recordFailure('PriceLabs prices', `${p.name}: PriceLabs returned no dates.`);
+    }
+  }
+  // No listing returned usable prices: treat as not loaded, not as an empty success
+  if (!Object.values(plData).some(d => Object.keys(d).length)) return null;
   return plData;
 }
 
-// Fallback: load PriceLabs data from a pre-generated JSON file (CoWork routine path)
+// Fallback: load PriceLabs data from a pre-generated JSON file. Local runs only;
+// in GitHub Actions a file must never stand in for live prices.
 function loadPriceLabsFile() {
   if (!PL_DATA_FILE) return null;
+  if (IS_CI) {
+    recordFailure('PriceLabs prices', 'PRICELABS_DATA_FILE is set in GitHub Actions; ignored (file prices are for local runs only).');
+    return null;
+  }
   try { return JSON.parse(readFileSync(PL_DATA_FILE, 'utf8')); }
   catch (e) { console.warn('Could not read PRICELABS_DATA_FILE:', e.message); return null; }
 }
@@ -322,17 +549,13 @@ function loadPriceLabsFile() {
 async function savePricingActions(plData, alertData, bookings, todayStr) {
   if (!SUPABASE_URL || !SUPABASE_KEY || !alertData || !plData) return 0;
 
-  // Fetch existing pending actions created today to avoid duplicates
-  const sinceToday = todayStr + 'T00:00:00Z';
-  const existingRes = await fetch(
-    `${SUPABASE_URL}/rest/v1/pricing_actions?status=eq.pending&created_at=gte.${sinceToday}&select=property_id,window_label`,
-    { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-  );
-  const existing = existingRes.ok ? await existingRes.json() : [];
+  // Fetch existing pending actions created today (Arizona day) to avoid duplicates
+  const sinceToday = encodeURIComponent(`${todayStr}T00:00:00${AZ_OFFSET}`);
+  const existing = await sb(`pricing_actions?status=eq.pending&created_at=gte.${sinceToday}&select=property_id,window_label`);
   const existingKey = new Set(existing.map(r => `${r.property_id}:${r.window_label}`));
 
   const toInsert = [];
-  for (const prop of PROPERTIES) {
+  for (const prop of plProps()) {
     const alerts = computePropertyAlerts(prop, plData, alertData, bookings, todayStr);
     const settings = alertData[prop.plId]?.settings;
     const currentBase = settings?.base ?? null;
@@ -381,7 +604,7 @@ async function savePricingActions(plData, alertData, bookings, todayStr) {
 // Upserts on (property_id, date) — safe to run daily, overwrites with latest data.
 async function snapshotPriceLabsData(plData, capturedAt) {
   const rows = [];
-  for (const prop of PROPERTIES) {
+  for (const prop of plProps()) {
     const prices = plData[prop.plId] || {};
     for (const [date, row] of Object.entries(prices)) {
       if (!row) continue;
@@ -403,7 +626,8 @@ async function snapshotPriceLabsData(plData, capturedAt) {
   if (!rows.length) return 0;
 
   const CHUNK = 500;
-  let upserted = 0;
+  const chunks = Math.ceil(rows.length / CHUNK);
+  let upserted = 0, failedChunks = 0;
   for (let i = 0; i < rows.length; i += CHUNK) {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/pricing_snapshots?on_conflict=property_id,date`, {
       method: 'POST',
@@ -417,10 +641,14 @@ async function snapshotPriceLabsData(plData, capturedAt) {
     });
     if (!r.ok) {
       const err = await r.text();
+      failedChunks++;
       console.warn(`  pricing_snapshots chunk ${Math.floor(i/CHUNK)+1} failed: ${err.slice(0, 120)}`);
     } else {
       upserted += rows.slice(i, i + CHUNK).length;
     }
+  }
+  if (failedChunks) {
+    recordFailure('Price snapshot', `FAILED: ${failedChunks} of ${chunks} chunks; ${upserted} of ${rows.length} rows saved to pricing_snapshots.`);
   }
   return upserted;
 }
@@ -431,38 +659,40 @@ async function plGet(path) {
   const res = await fetch(`https://api.pricelabs.co/v1${path}`, {
     headers: { 'X-API-Key': PRICELABS_KEY },
   });
-  if (!res.ok) { console.warn(`PriceLabs GET ${path} ${res.status}`); return null; }
+  if (!res.ok) throw new Error(`PriceLabs GET ${path.split('?')[0]} returned HTTP ${res.status}`);
   return res.json();
 }
 
-// Fetch listing settings (occupancy vs market) + neighborhood market percentiles for all properties
+// Fetch listing settings (occupancy vs market) + neighborhood market percentiles for all properties.
+// Every missing piece is recorded as a failure; result[plId].settings / .market are null when missing.
 async function fetchPricingAlertData() {
   if (!PRICELABS_KEY) return null;
+  // /listings returns every listing with occupancy_next_30/60 and market_occupancy_next_30/60
+  let allSettings = [];
   try {
-    // /listings returns all 4 with occupancy_next_30/60 and market_occupancy_next_30/60
-    const allSettings = await plGet('/listings').then(d => d?.listings || []).catch(() => []);
-
-    // Neighborhood data (market percentiles) per property — these are large, fetch in parallel
-    const marketResults = await Promise.all(
-      PROPERTIES.map(p =>
-        plGet(`/neighborhood_data?pms=ownerrez&listing_id=${p.plId}`)
-          .then(d => ({ plId: p.plId, data: d }))
-          .catch(() => ({ plId: p.plId, data: null }))
-      )
-    );
-
-    const result = {};
-    for (const p of PROPERTIES) {
-      result[p.plId] = {
-        settings: allSettings.find(s => String(s.id) === p.plId) || null,
-        market:   marketResults.find(r => r.plId === p.plId)?.data || null,
-      };
-    }
-    return result;
+    allSettings = (await plGet('/listings'))?.listings || [];
   } catch (e) {
-    console.warn('  Pricing alert data fetch failed:', e.message);
-    return null;
+    recordFailure('PriceLabs settings', `${e.message}; pricing alerts can't be checked.`);
   }
+
+  // Neighborhood data (market percentiles) per property — these are large, fetch in parallel
+  const marketResults = await Promise.all(
+    plProps().map(p =>
+      plGet(`/neighborhood_data?pms=ownerrez&listing_id=${p.plId}`)
+        .then(d => ({ plId: p.plId, data: d }))
+        .catch(e => { recordFailure('PriceLabs market data', `${p.name}: ${e.message}`); return { plId: p.plId, data: null }; })
+    )
+  );
+
+  const result = {};
+  for (const p of plProps()) {
+    const settings = allSettings.find(s => String(s.id) === p.plId) || null;
+    const market   = marketResults.find(r => r.plId === p.plId)?.data || null;
+    if (allSettings.length && !settings) recordFailure('PriceLabs settings', `${p.name}: listing ${p.plId} not found in PriceLabs /listings.`);
+    if (market && !market.data) recordFailure('PriceLabs market data', `${p.name}: neighborhood data came back empty.`);
+    result[p.plId] = { settings, market };
+  }
+  return result;
 }
 
 // Parse "25 %" → 0.25, null/undefined → null
@@ -473,22 +703,33 @@ function parseOcc(str) {
 }
 
 // Convert cumulative occupancy (occ_next_30, occ_next_60) to per-window rates
-// window 30 = days 1-30, window 60 = days 31-60
+// window 30 = days 1-30, window 60 = days 31-60. null when PriceLabs didn't
+// send the figure (never treated as 0% occupancy).
 function windowOcc(occ30str, occ60str, windowEnd) {
-  const o30 = parseOcc(occ30str) ?? 0;
-  const o60 = parseOcc(occ60str) ?? 0;
+  const o30 = parseOcc(occ30str);
+  const o60 = parseOcc(occ60str);
   if (windowEnd === 30) return o30;
-  if (windowEnd === 60) return Math.max(0, (o60 * 60 - o30 * 30) / 30);
+  if (windowEnd === 60) return o30 == null || o60 == null ? null : Math.max(0, (o60 * 60 - o30 * 30) / 30);
   return null; // 61-90 not available
 }
 
+// Pick the market category for this bedroom count. Falling back to another
+// bedroom count is recorded, since it compares against the wrong market.
+function marketCategory(series, seriesName, bedroomCount, propName) {
+  const catKey = String(bedroomCount);
+  if (series.Category[catKey]) return series.Category[catKey];
+  const fallbackKey = series.Category['1'] ? '1' : Object.keys(series.Category)[0];
+  if (fallbackKey == null) return null;
+  recordFailure('PriceLabs market data', `${propName}: no ${bedroomCount}-bedroom market in "${seriesName}"; compared against ${fallbackKey}-bedroom instead.`);
+  return series.Category[fallbackKey];
+}
+
 // Build date → market occupancy rate lookup from neighborhood_data "Future Occ/New/Canc"
-function parseMarketOccupancy(marketData, bedroomCount) {
+function parseMarketOccupancy(marketData, bedroomCount, propName) {
   if (!marketData?.data) return {};
   const foc = marketData.data['Future Occ/New/Canc'];
   if (!foc?.Category) return {};
-  const catKey = String(bedroomCount);
-  const category = foc.Category[catKey] || foc.Category['1'] || Object.values(foc.Category)[0];
+  const category = marketCategory(foc, 'Future Occ/New/Canc', bedroomCount, propName);
   if (!category) return {};
   const dates = category.X_values || [];
   // Future Occ Y_values is double-nested: Y_values[0][0] = actual data array
@@ -510,14 +751,16 @@ function propOccFromBookings(bookings, propId, startDay, endDay, todayStr) {
 }
 
 // Build date → { p25, p50, p75 } lookup from neighborhood_data for a given bedroom count
-function parseMarketPercentiles(marketData, bedroomCount) {
+function parseMarketPercentiles(marketData, bedroomCount, propName) {
   if (!marketData?.data) return {};
   const fpp = marketData.data['Future Percentile Prices'];
-  if (!fpp?.Category) return {};
+  if (!fpp?.Category) {
+    recordFailure('PriceLabs market data', `${propName}: no "Future Percentile Prices" in neighborhood data.`);
+    return {};
+  }
 
-  // Category keys are bedroom counts as strings; fall back to "1" if exact key missing
-  const catKey = String(bedroomCount);
-  const category = fpp.Category[catKey] || fpp.Category['1'] || Object.values(fpp.Category)[0];
+  // Category keys are bedroom counts as strings
+  const category = marketCategory(fpp, 'Future Percentile Prices', bedroomCount, propName);
   if (!category) return {};
 
   const dates   = category.X_values || [];
@@ -537,9 +780,12 @@ function computePropertyAlerts(prop, plData, alertData, bookings, todayStr) {
   if (!propAlertData?.settings || !propAlertData?.market) return [];
 
   const { settings, market } = propAlertData;
+  if (settings.occupancy_next_30 == null || settings.market_occupancy_next_30 == null) {
+    recordFailure('PriceLabs settings', `${prop.name}: occupancy figures missing; alerts use price thresholds only.`);
+  }
   const bedroomCount  = settings.no_of_bedrooms ?? 1;
-  const percentiles   = parseMarketPercentiles(market, bedroomCount);
-  const mktOccByDate  = parseMarketOccupancy(market, bedroomCount);
+  const percentiles   = parseMarketPercentiles(market, bedroomCount, prop.name);
+  const mktOccByDate  = parseMarketOccupancy(market, bedroomCount, prop.name);
   const prices        = plData?.[prop.plId] ?? {};
   const occ           = occupiedSet(bookings, prop.id); // open nights only — booked nights can't be repriced
 
@@ -667,10 +913,12 @@ function sectionPricingAlerts(plData, alertData, bookings, todayStr) {
 
   // Collect rows for ALL properties × ALL windows (not just alerting ones)
   const allRows = [];
-  for (const prop of PROPERTIES) {
-    const propRows = computePropertyAlerts(prop, plData, alertData, bookings, todayStr);
-    propRows.forEach(a => allRows.push({ prop, ...a }));
-  }
+  PROPERTIES.forEach((prop, i) => {
+    const first = allRows.length;
+    if (!prop.plId) allRows.push({ prop, noListing: true });
+    else computePropertyAlerts(prop, plData, alertData, bookings, todayStr).forEach(a => allRows.push({ prop, ...a }));
+    if (allRows.length > first) allRows[first].groupRow = groupRow(prop, i, 8);
+  });
 
   const redAlerts = allRows.filter(a => a.level === 'RED');
   const ylwAlerts = allRows.filter(a => a.level === 'YELLOW');
@@ -698,6 +946,14 @@ function sectionPricingAlerts(plData, alertData, bookings, todayStr) {
     </tr>`;
 
   for (const a of allRows) {
+    html += a.groupRow || '';
+    if (a.noListing) {
+      html += `<tr style="border-bottom:1px solid #f0f0f0;">
+        <td style="padding:7px 10px;">${badge(a.prop.name, a.prop.color)}</td>
+        <td colspan="7" style="padding:7px 10px;color:#888;font-style:italic;">No PriceLabs listing linked</td>
+      </tr>`;
+      continue;
+    }
     const isRed = a.level === 'RED';
     const isYlw = a.level === 'YELLOW';
     const isOK  = a.level === 'OK';
@@ -771,11 +1027,12 @@ function gapNights(bookings, propId, from, to) {
 
 // Build the discount offer table for a gap night
 // baseRentPerNight = charges_json rent / nights from adjacent booking (= PriceLabs net target)
-// taxRate = total property tax rate as a decimal (e.g. 0.13)
+// taxRate = total tax rate in effect on the gap night, as a decimal (e.g. 0.1397);
+//           null when the property has no confirmed tax profile
 // prevChannel / nextChannel = booking channels of adjacent guests
 function gapDiscountTable(baseRentPerNight, taxRate, prevChannel, nextChannel) {
   if (!baseRentPerNight || baseRentPerNight < 0) return '';
-  const tax = taxRate || 0;
+  const tax = taxRate;
   const channels = [...new Set([prevChannel, nextChannel].filter(Boolean))];
   const tiers = [20, 25, 30, 35];
 
@@ -789,7 +1046,7 @@ function gapDiscountTable(baseRentPerNight, taxRate, prevChannel, nextChannel) {
     // Guest's per-night rent after discount (what they pay for rent, excl. taxes)
     const discountedRent = Math.round(baseRentPerNight * (1 - pct / 100) * 100) / 100;
     // Total guest pays per gap night including all taxes
-    const guestTotal = Math.round(discountedRent * (1 + tax) * 100) / 100;
+    const guestTotal = tax == null ? null : Math.round(discountedRent * (1 + tax) * 100) / 100;
     // Chris's net per night from rent (after channel fee, taxes go to authorities)
     const netCols = channels.map(ch =>
       `<td style="padding:5px 8px;text-align:right;color:#555;">${fmt$(Math.round(discountedRent * (1 - channelFee(ch))))}</td>`
@@ -806,7 +1063,7 @@ function gapDiscountTable(baseRentPerNight, taxRate, prevChannel, nextChannel) {
     <tr style="background:#f8f9fa;">
       <th style="padding:5px 8px;text-align:left;color:#555;font-weight:600;">Offer</th>
       <th style="padding:5px 8px;text-align:right;color:#555;font-weight:600;">Rent/Night</th>
-      <th style="padding:5px 8px;text-align:right;color:#555;font-weight:600;">Guest Pays<br><span style="font-weight:400;font-size:10px;">incl. ${(tax*100).toFixed(2)}% tax</span></th>
+      <th style="padding:5px 8px;text-align:right;color:#555;font-weight:600;">Guest Pays<br><span style="font-weight:400;font-size:10px;">${tax == null ? 'tax profile missing' : `incl. ${(tax*100).toFixed(2)}% tax`}</span></th>
       ${channelHeaders}
     </tr>${rows}
   </table>`;
@@ -1034,20 +1291,20 @@ function sectionMTD(mtd, todayStr) {
     .toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
 
   let rows = '', totalCur = 0, totalLY = 0;
-  for (const p of PROPERTIES) {
+  PROPERTIES.forEach((p, i) => {
     const c = cur[p.id], l = ly[p.id];
     totalCur += c.gross; totalLY += l.gross;
     const yoy = l.gross ? ((c.gross - l.gross) / l.gross) * 100 : null;
     const yoyStr = yoy != null ? `${yoy >= 0 ? '+' : ''}${Math.round(yoy)}%` : '—';
     const yoyColor = yoy == null ? '#999' : yoy >= 0 ? '#1a7f5a' : '#c0392b';
-    rows += `<tr>
+    rows += groupRow(p, i, 5) + `<tr>
       <td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;">${tag(p)}</td>
       <td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;text-align:right;font-weight:600;">${fmt$(c.gross)}</td>
       <td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;text-align:right;color:#666;">${fmt$(l.gross)}</td>
       <td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;text-align:right;font-weight:600;color:${yoyColor};">${yoyStr}</td>
       <td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;text-align:right;color:#888;font-size:12px;">${c.count} bkg · ${c.nights} nts</td>
     </tr>`;
-  }
+  });
   const totYoY = totalLY ? ((totalCur - totalLY) / totalLY * 100) : null;
   const totYoYStr = totYoY != null ? `${totYoY >= 0 ? '+' : ''}${Math.round(totYoY)}%` : '—';
   const totColor = totYoY == null ? '#999' : totYoY >= 0 ? '#1a7f5a' : '#c0392b';
@@ -1081,13 +1338,13 @@ function sectionBookingPace(tyBookings, lyBookings, paceMonths, todayStr) {
   // (Scottsdale zero-LY is explained by the short-notice note below, not a data gap)
   const noLyProps = PROPERTIES.filter(p =>
     !lyBookings.some(b => b.property_id === p.id) &&
-    !p.location.includes('Scottsdale')
+    p.market !== MARKETS.SCOTTSDALE
   );
   if (noLyProps.length > 0)
     contextNotes.push(`${noLyProps.map(p => p.name).join(' & ')} show${noLyProps.length === 1 ? 's' : ''} $0 LY — no prior-year data at this snapshot point`);
 
   // Note 2: Any pace month in May–Sep for a Scottsdale property = last-minute booking market
-  const scPropIds = new Set(PROPERTIES.filter(p => p.location.includes('Scottsdale')).map(p => p.id));
+  const scPropIds = new Set(PROPERTIES.filter(p => p.market === MARKETS.SCOTTSDALE).map(p => p.id));
   const hasScottsdaleSummer = paceMonths.some(m => {
     const mo = parseInt(m.start.slice(5, 7));
     return mo >= 5 && mo <= 9;
@@ -1122,21 +1379,21 @@ function sectionBookingPace(tyBookings, lyBookings, paceMonths, todayStr) {
 
     let rows = '';
     let totTYRev = 0, totLYRev = 0, totTYNts = 0, totLYNts = 0;
-    for (const p of PROPERTIES) {
+    PROPERTIES.forEach((p, i) => {
       const tyRev = ty[p.id].revenue, lyRev = ly[p.id].revenue;
       const tyNts = ty[p.id].nights,  lyNts = ly[p.id].nights;
       totTYRev += tyRev; totLYRev += lyRev; totTYNts += tyNts; totLYNts += lyNts;
       const yoy      = lyRev > 0 ? (tyRev - lyRev) / lyRev * 100 : null;
       const yoyStr   = yoy != null ? `${yoy >= 0 ? '+' : ''}${Math.round(yoy)}%` : '—';
       const yoyColor = yoy == null ? '#999' : yoy >= 5 ? '#1a7f5a' : yoy < -5 ? '#c0392b' : '#e67e22';
-      rows += `<tr>
+      rows += groupRow(p, i, 5) + `<tr>
         <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;">${tag(p)}</td>
         <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;font-weight:600;">${fmt$(Math.round(tyRev))}</td>
         <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;color:#666;">${fmt$(Math.round(lyRev))}</td>
         <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;font-weight:600;color:${yoyColor};">${yoyStr}</td>
         <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;color:#888;font-size:12px;">${Math.round(tyNts)}n / ${Math.round(lyNts)}n</td>
       </tr>`;
-    }
+    });
     const totYoY    = totLYRev > 0 ? (totTYRev - totLYRev) / totLYRev * 100 : null;
     const totYoYStr = totYoY != null ? `${totYoY >= 0 ? '+' : ''}${Math.round(totYoY)}%` : '—';
     const totColor  = totYoY == null ? '#999' : totYoY >= 5 ? '#1a7f5a' : totYoY < -5 ? '#c0392b' : '#e67e22';
@@ -1181,7 +1438,8 @@ function sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, his
     const excludedFromScenarios = [];
 
     let rows = '';
-    for (const f of forecasts) {
+    forecasts.forEach((f, i) => {
+      rows += groupRow(f.prop, i, 8);
       totConfirmed += f.confirmedRevenue;
       totLY        += f.lyActualRevenue;
 
@@ -1215,6 +1473,7 @@ function sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, his
         excludedFromScenarios.push(f.prop.name);
         const msg = f.error === 'no_fill_rate_data'
           ? 'Insufficient history'
+          : !f.prop.plId ? 'No PriceLabs listing linked'
           : plData ? 'No price data' : 'PriceLabs unavailable';
         scenarioCells = `<td colspan="3" style="padding:7px 10px;text-align:center;color:#aaa;font-size:11px;">${msg}</td>`;
       } else {
@@ -1252,7 +1511,7 @@ function sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, his
           </td>
         </tr>`;
       }
-    }
+    });
 
     // Portfolio total row — show partial scenarios with exclusion note if some properties lack data
     const totBaseColor = (totBase > 0 && totLY > 0 && totBase < totLY * 0.85) ? '#c0392b' : '#333';
@@ -1381,7 +1640,7 @@ function sectionSmartEvents(hardcodedEvents, cachedEvents, plData, histActive, t
 
   for (const ev of upcoming) {
     // Which properties are affected by this market?
-    const affectedProps = PROPERTIES.filter(p => PROP_MARKET[p.id] === ev.market);
+    const affectedProps = PROPERTIES.filter(p => p.market === ev.market);
 
     for (const prop of affectedProps) {
       const dateRange = ev.start_date === ev.end_date
@@ -1505,7 +1764,7 @@ function sectionSmartEvents(hardcodedEvents, cachedEvents, plData, histActive, t
     html += `<div style="margin-top:16px;padding:12px 16px;background:#f8f9fa;border-radius:6px;border-left:3px solid #ccc;">
       <div style="font-size:12px;font-weight:700;color:#555;margin-bottom:8px;">📅 Coming Up (91–120 days) — informational</div>`;
     for (const ev of lookahead) {
-      const affectedProps = PROPERTIES.filter(p => PROP_MARKET[p.id] === ev.market);
+      const affectedProps = PROPERTIES.filter(p => p.market === ev.market);
       const propNames = affectedProps.map(p => p.name).join(', ');
       const dateRange = ev.start_date === ev.end_date
         ? fmtDate(ev.start_date)
@@ -1566,11 +1825,12 @@ function sectionActivity({ newBookings, cancellations }) {
   return html;
 }
 
-function sectionOpenNights(bookings, todayStr, taxRates) {
+function sectionOpenNights(bookings, todayStr, taxProfiles) {
   const t30 = addDays(todayStr, 30), t60 = addDays(todayStr, 60), t90 = addDays(todayStr, 90);
   let html = `<h2 id="section-gaps" style="${H2}">📅 Open Nights & Gap Opportunities</h2>`;
 
-  for (const p of PROPERTIES) {
+  PROPERTIES.forEach((p, i) => {
+    html += groupHeading(p, i);
     const o30 = openDates(bookings, p.id, todayStr, t30).length;
     const o60 = openDates(bookings, p.id, t30, t60).length;
     const o90 = openDates(bookings, p.id, t60, t90).length;
@@ -1601,7 +1861,6 @@ function sectionOpenNights(bookings, todayStr, taxRates) {
       </table>`;
 
     if (gaps.length) {
-      const propTaxRate = taxRates?.[p.id] || 0;
       html += `<div style="margin-top:8px;padding:10px 14px;background:#fff8e1;border-radius:6px;border-left:3px solid #f39c12;">
         <div style="font-size:12px;font-weight:700;color:#e67e22;margin-bottom:8px;">⚡ Gap Nights — outreach opportunities (${gaps.length})</div>`;
       for (const g of gaps) {
@@ -1617,7 +1876,7 @@ function sectionOpenNights(bookings, todayStr, taxRates) {
             ${g.nextGuest || 'Guest'} checkin ${fmtDate(g.checkIn)} (${g.nextChannel || 'Direct'}) →
           </div>
           ${g.baseRentPerNight
-            ? gapDiscountTable(g.baseRentPerNight, propTaxRate, g.prevChannel, g.nextChannel)
+            ? gapDiscountTable(g.baseRentPerNight, taxRateOn(taxProfiles, p.id, g.dates[0]), g.prevChannel, g.nextChannel)
             : `<p style="font-size:12px;color:#aaa;font-style:italic;margin:4px 0;">Rent data unavailable for discount calculation</p>`
           }
         </div>`;
@@ -1625,7 +1884,7 @@ function sectionOpenNights(bookings, todayStr, taxRates) {
       html += `</div>`;
     }
     html += `</div>`;
-  }
+  });
   return html;
 }
 
@@ -1634,21 +1893,26 @@ function sectionPrices(bookings, plData, todayStr, alertData) {
   let html = `<h2 id="section-prices" style="${H2}">💰 Pricing — Open Days (Next 90)</h2>`;
 
   if (!plData) {
-    html += `<p style="color:#888;font-style:italic;font-size:13px;">
-      PriceLabs prices unavailable right now — this typically happens during their overnight recalculation (usually complete by 6am AZ time). The 7am scheduled send will have full pricing data.
+    html += `<p style="color:#c0392b;font-size:13px;">
+      PriceLabs prices unavailable — see the alert at the top of this email for the cause.
     </p>`;
     return html;
   }
 
-  for (const p of PROPERTIES) {
+  PROPERTIES.forEach((p, i) => {
+    html += groupHeading(p, i);
+    if (!p.plId) {
+      html += `<div style="margin-bottom:16px;">${tag(p)} <span style="color:#888;font-size:13px;font-style:italic;margin-left:8px;">No PriceLabs listing linked</span></div>`;
+      return;
+    }
     const open = openDates(bookings, p.id, todayStr, t90);
     const propPrices = plData[p.plId] || {};
-    // Use live min price from PriceLabs settings; fall back to hardcoded value
-    const liveMinPrice = alertData?.[p.plId]?.settings?.min ?? p.minPrice;
+    // Min price from live PriceLabs settings
+    const liveMinPrice = alertData?.[p.plId]?.settings?.min ?? null;
 
     if (!open.length) {
       html += `<div style="margin-bottom:16px;">${tag(p)} <span style="color:#1a7f5a;font-size:13px;margin-left:8px;">Fully booked for the next 90 days 🎉</span></div>`;
-      continue;
+      return;
     }
 
     // Annotate open dates with PriceLabs data
@@ -1704,7 +1968,7 @@ function sectionPrices(bookings, plData, todayStr, alertData) {
       }
     }
     html += `</div>`;
-  }
+  });
   return html;
 }
 
@@ -1717,7 +1981,32 @@ const SECTION = `background:#fff;border-radius:8px;padding:20px 24px;margin-bott
 
 // Note: SVG icons are stripped by Gmail — using emoji instead for universal rendering
 
-function buildEmail(todayStr, sections, priorityBoardHtml = '') {
+// Red banner listing every failed or partial step (and any warnings) at the top
+// of the email. Empty string when the run was clean.
+function sectionStatusBanner() {
+  if (!failures.length && !warnings.length) return '';
+  const item = (x, color) =>
+    `<li style="margin:3px 0;color:${color};"><strong>${x.step}:</strong> ${x.detail}</li>`;
+  const failHtml = failures.length
+    ? `<div style="font-size:14px;font-weight:700;color:#c0392b;margin:0 0 6px;">⚠ ${failures.length} problem${failures.length > 1 ? 's' : ''} in today's report — numbers that depend on ${failures.length > 1 ? 'these' : 'this'} may be missing or incomplete</div>
+       <ul style="margin:0 0 ${warnings.length ? '10px' : '0'};padding-left:18px;font-size:12px;">${failures.map(f => item(f, '#7f1d1d')).join('')}</ul>`
+    : '';
+  const warnHtml = warnings.length
+    ? `<div style="font-size:13px;font-weight:700;color:#b45309;margin:0 0 4px;">Heads up</div>
+       <ul style="margin:0;padding-left:18px;font-size:12px;">${warnings.map(w => item(w, '#78350f')).join('')}</ul>`
+    : '';
+  const border = failures.length ? '#e74c3c' : '#d97706';
+  const bg     = failures.length ? '#fff0f0' : '#fffbf0';
+  return `<div style="background:${bg};border-radius:10px;padding:14px 20px;margin-bottom:16px;border:1px solid ${border}55;border-left:4px solid ${border};">${failHtml}${warnHtml}</div>`;
+}
+
+// Short section placeholder when the data a section needs failed to load
+function sectionUnavailable(id, title) {
+  return `<h2 id="${id}" style="${H2}">${title}</h2>
+  <p style="color:#c0392b;font-size:13px;">Data for this section couldn't be loaded — see the alert at the top of this email.</p>`;
+}
+
+function buildEmail(todayStr, sections, priorityBoardHtml = '', bannerHtml = '') {
   const timeStr = new Date().toLocaleString('en-US', {
     timeZone: 'America/Phoenix', hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
   });
@@ -1742,6 +2031,7 @@ function buildEmail(todayStr, sections, priorityBoardHtml = '') {
     </table>
   </div>
 
+  ${bannerHtml}
   ${priorityBoardHtml}
   ${sections.map(s => `<div style="${SECTION}">${s}</div>`).join('')}
 
@@ -1790,7 +2080,10 @@ async function fetchLastBookedDates() {
     PROPERTIES.map(p =>
       sb(`bookings?select=property_id,booked_at&property_id=eq.${p.id}&status=eq.active&order=booked_at.desc&limit=1`)
         .then(rows => ({ propId: p.id, booked_at: rows[0]?.booked_at ?? null }))
-        .catch(() => ({ propId: p.id, booked_at: null }))
+        .catch(e => {
+          recordFailure('Last booking date', `${p.name}: ${e.message}; the "no new bookings" check was skipped.`);
+          return { propId: p.id, booked_at: null };
+        })
     )
   );
   const map = {};
@@ -1816,7 +2109,7 @@ function alertBecause(a) {
   return `Average price ${ptsAbove}% above market median (${fmt$(a.avgPrice)} vs ${fmt$(a.mktP50)}).${occStr} A modest reduction in PriceLabs may improve booking velocity.`;
 }
 
-function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, activity, mtd, tyBookings, lyBookings, paceMonths, hardcodedEvents, cachedEvents, taxRates, todayStr) {
+function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, activity, mtd, tyBookings, lyBookings, paceMonths, hardcodedEvents, cachedEvents, todayStr) {
   const now = new Date();
   const t14 = addDays(todayStr, 14);
   const t30 = addDays(todayStr, 30);
@@ -1881,7 +2174,7 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
     for (const evt of [...hardcodedEvents, ...cachedEvents]) {
       if (evt.end_date < todayStr || evt.start_date > t30) continue;
       if (!['high', 'very-high'].includes((evt.impact || '').toLowerCase())) continue;
-      if (PROP_MARKET[prop.id] !== evt.market) continue;
+      if (prop.market !== evt.market) continue;
       if (hasPricingAlert && /peak season/i.test(evt.name)) continue;
       const key = `${evt.name}|${evt.start_date}`;
       if (seenEvt.has(key)) continue;
@@ -1934,8 +2227,8 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
   }
 
   // ── Portfolio note (MTD) ──────────────────────────────────────────────────
-  const curRevTotal = mtd.cur.reduce((s, b) => s + (Number(b.gross_revenue) || 0), 0);
-  const lyRevTotal  = mtd.ly.reduce((s, b) => s + (Number(b.gross_revenue) || 0), 0);
+  const curRevTotal = (mtd?.cur ?? []).reduce((s, b) => s + (Number(b.gross_revenue) || 0), 0);
+  const lyRevTotal  = (mtd?.ly ?? []).reduce((s, b) => s + (Number(b.gross_revenue) || 0), 0);
   let portfolioNote = null;
   if (lyRevTotal > 200 && curRevTotal < lyRevTotal * 0.85) {
     const pct = Math.round((1 - curRevTotal / lyRevTotal) * 100);
@@ -1958,8 +2251,9 @@ function sectionPriorityBoard({ summaries, portfolioNote }, todayStr) {
   const boardHeader = `<h2 style="font-size:15px;font-weight:700;color:#1a1a2e;margin:0 0 8px;padding-bottom:10px;border-bottom:2px solid #c5d9ee;">⚡ Today's Action Board — ${fmtDateL(todayStr)}</h2>`;
   const legend      = `<p style="font-size:11px;color:#666;margin:0 0 14px;padding:0;">🔴 Needs Attention &nbsp;·&nbsp; 🟡 Watch &nbsp;·&nbsp; 🟢 On Track</p>`;
 
-  const cards = summaries.map(({ prop, synopsis, actions, status }) => {
+  const cards = summaries.map(({ prop, synopsis, actions, status }, i) => {
     const s = STATUS[status];
+    const heading = groupHeading(prop, i);
     const header = `<table cellpadding="0" cellspacing="0" border="0" style="width:100%;background:${s.headerBg};border-bottom:1px solid ${s.cardBorder};"><tr>
       <td style="padding:8px 14px;font-weight:700;font-size:13px;color:${s.color};">${s.emoji} ${prop.name}</td>
       <td style="padding:8px 14px;text-align:right;font-size:11px;color:#888;">${prop.location}</td>
@@ -1977,7 +2271,7 @@ function sectionPriorityBoard({ summaries, portfolioNote }, todayStr) {
       }).join('');
       body = `<div style="padding:4px 14px 10px;">${rows}</div>`;
     }
-    return `<div style="margin-bottom:10px;border-radius:8px;overflow:hidden;border:1px solid ${s.cardBorder};border-left:4px solid ${s.border};">${header}${syn}${body}</div>`;
+    return `${heading}<div style="margin-bottom:10px;border-radius:8px;overflow:hidden;border:1px solid ${s.cardBorder};border-left:4px solid ${s.border};">${header}${syn}${body}</div>`;
   }).join('');
 
   const portHtml = portfolioNote
@@ -1996,7 +2290,7 @@ function buildSamplePlData(bookings, todayStr) {
   const DEMAND_POOL = ['Low Demand','Low Demand','Normal Demand','Normal Demand','High Demand','Very High Demand'];
   const BASE = { 5: 260, 6: 195, 7: 105, 8: 110 };
   const data = {};
-  for (const p of PROPERTIES) {
+  for (const p of plProps()) {
     data[p.plId] = {};
     const occ = occupiedSet(bookings, p.id);
     for (let i = 0; i < 90; i++) {
@@ -2004,7 +2298,7 @@ function buildSamplePlData(bookings, todayStr) {
       if (occ.has(d)) continue;
       const dow = new Date(d + 'T00:00:00Z').getUTCDay();
       const isWknd = dow === 5 || dow === 6;
-      const base = BASE[p.id] * (isWknd ? 1.3 : 1) * (1 + i / 400);
+      const base = (BASE[p.id] ?? 150) * (isWknd ? 1.3 : 1) * (1 + i / 400);
       const demand = DEMAND_POOL[Math.floor(Math.random() * DEMAND_POOL.length)];
       const hasOverride = Math.random() < 0.12;
       data[p.plId][d] = {
@@ -2020,66 +2314,94 @@ function buildSamplePlData(bookings, todayStr) {
   return data;
 }
 
+// Run log row for this run (null for preview runs or if the run log write failed)
+let RUN_ID = null;
+
 async function main() {
   const todayStr = today();
   const t90 = addDays(todayStr, 90);
   const PREVIEW_OUT = ENV.PREVIEW_OUT;
 
-  console.log(`Daily report for ${todayStr}${PREVIEW_OUT ? ' [PREVIEW MODE]' : ''}`);
+  console.log(`Daily report for ${todayStr} (Arizona)${PREVIEW_OUT ? ' [PREVIEW MODE]' : ''} · ref ${GIT_REF} · ${TRIGGER_EVENT}${FORCE_SEND ? ' · forced' : ''}`);
+
+  // ── Run log: skip if this ref already sent today (unless forced) ──────────
+  if (!PREVIEW_OUT) {
+    if (FORCE_SEND) {
+      console.log('  Forced run: skipping the "already sent today" check');
+    } else {
+      // If the check itself fails, send anyway: a duplicate beats no report
+      const sent = await step('Run log', () => alreadySentToday(todayStr));
+      if (sent) {
+        try { await startRunLog(todayStr, 'skipped'); }
+        catch (e) { console.warn(`  Could not record the skipped run: ${e.message}`); }
+        console.log(`  Already sent today from ${GIT_REF}; recorded as skipped. No email sent.`);
+        return;
+      }
+    }
+    RUN_ID = await step('Run log', () => startRunLog(todayStr, 'running'));
+    await step('Run log', () => checkYesterdaySent(todayStr));
+  }
+
+  // ── Properties (required: without them there is no report) ───────────────
+  PROPERTIES = await loadProperties();
+  if (!PROPERTIES.length) throw new Error('No live properties found (onboarding_status live, active, OwnerRez ID set).');
+  for (const p of PROPERTIES) {
+    if (!p.plId) recordWarning('PriceLabs', `${p.name}: no PriceLabs listing linked; prices, alerts and forecast are skipped for it.`);
+    if (!p.market) recordWarning('Events', `${p.name}: no event calendar for ${p.location || 'this market'}.`);
+  }
+  console.log(`  Properties: ${PROPERTIES.map(p => `${p.name} (${groupLabel(p)})`).join(', ')}`);
 
   const paceMonths = getPaceMonths(todayStr);
-  const cachedEvents = fetchEventsCache();
-  const [activity, mtd, bookings, taxRates, paceData, forecastData, lastBookedMap] = await Promise.all([
-    fetchRecentActivity(),
-    fetchMTDRevenue(todayStr),
-    fetchBookings90(todayStr, t90),
-    fetchTaxRates(),
-    fetchBookingPaceData(paceMonths, todayStr),
-    fetchRevenueForecastData(paceMonths, todayStr),
+  const cachedEvents = fetchEventsCache(todayStr);
+  const [activity, mtd, bookings, taxProfiles, paceData, forecastData, lastBookedMap] = await Promise.all([
+    step('Recent activity', fetchRecentActivity),
+    step('Month-to-date revenue', () => fetchMTDRevenue(todayStr)),
+    step('Bookings (next 90 days)', () => fetchBookings90(todayStr, t90)),
+    step('Tax profiles', fetchTaxProfiles),
+    step('Booking pace', () => fetchBookingPaceData(paceMonths, todayStr)),
+    step('Revenue forecast history', () => fetchRevenueForecastData(paceMonths, todayStr)),
     fetchLastBookedDates(),
   ]);
-  const { tyBookings, lyBookings } = paceData;
-  const { tyBlocked, histActive, histBlocked } = forecastData;
+  // Open nights, gaps, prices and alerts all depend on the 90-day bookings
+  if (!bookings) throw new Error('Bookings for the next 90 days could not be loaded.');
+  const { tyBookings, lyBookings } = paceData ?? { tyBookings: null, lyBookings: null };
+  const { tyBlocked, histActive, histBlocked } = forecastData ?? { tyBlocked: null, histActive: null, histBlocked: null };
 
-  console.log(`  Bookings (90d): ${bookings.length} | New: ${activity.newBookings.length} | Cancelled: ${activity.cancellations.length} | MTD: ${mtd.cur.length}`);
-  console.log(`  Pace months: ${paceMonths.map(m => m.label).join(', ')} | TY: ${tyBookings.length} bkgs | LY: ${lyBookings.length} bkgs`);
-  console.log(`  Forecast: ${histActive.length} historical bookings | ${tyBlocked.length} current-yr blocks`);
+  console.log(`  Bookings (90d): ${bookings.length} | New: ${activity?.newBookings.length ?? '—'} | Cancelled: ${activity?.cancellations.length ?? '—'} | MTD: ${mtd?.cur.length ?? '—'}`);
+  console.log(`  Pace months: ${paceMonths.map(m => m.label).join(', ')} | TY: ${tyBookings?.length ?? '—'} bkgs | LY: ${lyBookings?.length ?? '—'} bkgs`);
+  console.log(`  Forecast: ${histActive?.length ?? '—'} historical bookings | ${tyBlocked?.length ?? '—'} current-yr blocks`);
 
-  // PriceLabs: try REST API first, then file fallback, then preview sample
+  // PriceLabs: file fallback (local only), then REST API, then preview sample
   let plData = loadPriceLabsFile();
-  if (!plData && PRICELABS_KEY) {
+  if (!plData) {
     console.log('  Fetching PriceLabs prices from API...');
-    try { plData = await fetchPriceLabsData(todayStr, t90); }
-    catch (e) { console.warn('  PriceLabs API fetch failed:', e.message); }
+    plData = await step('PriceLabs prices', () => fetchPriceLabsData(todayStr, t90));
   }
   if (!plData && PREVIEW_OUT) {
     console.log('  PriceLabs data: generating sample data for preview');
+    recordWarning('PriceLabs prices', 'Preview is using made-up sample prices.');
     plData = buildSamplePlData(bookings, todayStr);
   }
   console.log(`  PriceLabs data: ${plData ? 'loaded (' + Object.keys(plData).length + ' listings)' : 'not available'}`);
 
   // Snapshot PriceLabs prices to Supabase for historical analysis
   if (plData && PRICELABS_KEY && !PREVIEW_OUT) {
-    try {
-      const n = await snapshotPriceLabsData(plData, new Date().toISOString());
-      console.log(`  ✓ pricing_snapshots: ${n} rows upserted`);
-    } catch (e) { console.warn('  pricing_snapshots failed (non-fatal):', e.message); }
+    const before = failures.length;
+    const n = await step('Price snapshot', () => snapshotPriceLabsData(plData, new Date().toISOString()));
+    if (failures.length === before) console.log(`  ✓ pricing_snapshots: ${n} rows upserted`);
   }
 
   // Pricing alerts: listing settings + neighborhood market percentiles
   let alertData = null;
   if (PRICELABS_KEY && plData) {
     console.log('  Fetching pricing alert data (settings + market percentiles)...');
-    try { alertData = await fetchPricingAlertData(); }
-    catch (e) { console.warn('  Pricing alert fetch failed:', e.message); }
+    alertData = await step('PriceLabs settings', fetchPricingAlertData);
   }
 
   // Save RED/YELLOW alerts to pricing_actions for portal approval workflow
   if (alertData && plData && !PREVIEW_OUT) {
-    try {
-      const n = await savePricingActions(plData, alertData, bookings, todayStr);
-      console.log(`  ✓ pricing_actions: ${n} new action(s) written`);
-    } catch (e) { console.warn('  pricing_actions write failed (non-fatal):', e.message); }
+    const n = await step('Pricing actions', () => savePricingActions(plData, alertData, bookings, todayStr));
+    if (n != null) console.log(`  ✓ pricing_actions: ${n} new action(s) written`);
   }
 
   const hardcodedEvents = getHardcodedEvents(todayStr);
@@ -2087,24 +2409,30 @@ async function main() {
 
   // Priority Action Board: per-property summary with action items
   console.log('  Building Priority Action Board...');
-  const { summaries, portfolioNote } = buildPropertySummaries(plData, alertData, bookings, lastBookedMap, activity, mtd, tyBookings, lyBookings, paceMonths, hardcodedEvents, cachedEvents, taxRates, todayStr);
+  const { summaries, portfolioNote } = buildPropertySummaries(
+    plData, alertData, bookings, lastBookedMap,
+    activity ?? { newBookings: [], cancellations: [] }, mtd,
+    tyBookings ?? [], lyBookings ?? [], paceMonths, hardcodedEvents, cachedEvents, todayStr);
   const priorityBoardHtml = sectionPriorityBoard({ summaries, portfolioNote }, todayStr);
   const totalActions = summaries.reduce((n, s) => n + s.actions.length, 0);
   console.log(`  ✓ Priority Action Board: ${totalActions} action items across ${summaries.length} properties`);
 
   const sections = [
-    sectionMTD(mtd, todayStr),
-    sectionActivity(activity),
+    mtd       ? sectionMTD(mtd, todayStr) : sectionUnavailable('section-mtd', '📊 Month-to-Date Revenue'),
+    activity  ? sectionActivity(activity) : sectionUnavailable('section-activity', '🔔 Activity — Last 24 Hours'),
     sectionPricingAlerts(plData, alertData, bookings, todayStr),
-    sectionSmartEvents(hardcodedEvents, cachedEvents, plData, histActive, todayStr),
-    sectionOpenNights(bookings, todayStr, taxRates),
-    sectionBookingPace(tyBookings, lyBookings, paceMonths, todayStr),
-    sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData),
+    sectionSmartEvents(hardcodedEvents, cachedEvents, plData, histActive ?? [], todayStr),
+    sectionOpenNights(bookings, todayStr, taxProfiles),
+    paceData  ? sectionBookingPace(tyBookings, lyBookings, paceMonths, todayStr) : sectionUnavailable('section-pace', '📈 Booking Pace vs Last Year'),
+    paceData && forecastData
+      ? sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData)
+      : sectionUnavailable('section-forecast', '🔮 Revenue Forecast'),
     sectionPrices(bookings, plData, todayStr, alertData),
   ];
 
-  const html = buildEmail(todayStr, sections, priorityBoardHtml);
-  const subject = `PPS Daily Report · ${fmtDateL(todayStr)}`;
+  // Banner is built last so it lists every failure recorded above
+  const html = buildEmail(todayStr, sections, priorityBoardHtml, sectionStatusBanner());
+  const subject = `${failures.length || warnings.length ? '[Issues] ' : ''}PPS Daily Report · ${fmtDateL(todayStr)}`;
 
   if (PREVIEW_OUT) {
     const { writeFileSync } = await import('fs');
@@ -2116,6 +2444,35 @@ async function main() {
   console.log('  Sending via Resend...');
   const result = await sendEmail(html, subject);
   console.log(`  ✓ Sent! ID: ${result.id}`);
+
+  const status = failures.length ? 'sent_with_failures' : 'sent';
+  try { await finishRunLog(RUN_ID, status, result.id); }
+  catch (e) { recordFailure('Run log', e.message); }
+
+  if (failures.length) {
+    console.error(`  ${failures.length} step(s) failed (listed in the email banner); exiting 1 so the workflow shows red.`);
+    process.exitCode = 1;
+  }
 }
 
-main().catch(err => { console.error('Fatal:', err); process.exit(1); });
+// The report couldn't be built (or the email couldn't be sent): try a short
+// failure email so the morning isn't silent, mark the run failed, exit 1.
+async function handleFatal(err) {
+  console.error('Fatal:', err);
+  recordFailure('Report', err.message);
+  const todayStr = today();
+  if (!ENV.PREVIEW_OUT) {
+    try {
+      const body = `<h2 style="${H2}">The daily report couldn't be built today</h2>
+        <p style="font-size:13px;color:#444;">Nothing else was sent. Check the GitHub Actions run${GITHUB_RUN_ID ? ` (run ${GITHUB_RUN_ID})` : ''} for details.</p>`;
+      const html = buildEmail(todayStr, [body], '', sectionStatusBanner());
+      const result = await sendEmail(html, `[Issues] PPS Daily Report FAILED · ${fmtDateL(todayStr)}`);
+      console.error(`  Failure email sent: ${result.id}`);
+    } catch (e) { console.error('  Failure email could not be sent:', e.message); }
+    try { await finishRunLog(RUN_ID, 'failed', null); }
+    catch (e) { console.error('  Run log update failed:', e.message); }
+  }
+  process.exit(1);
+}
+
+main().catch(handleFatal);

@@ -89,7 +89,6 @@ const addDays = (d, n) => { const x = new Date(d + 'T00:00:00Z'); x.setUTCDate(x
 const diffDays = (a, b) => Math.round((new Date(b + 'T00:00:00Z') - new Date(a + 'T00:00:00Z')) / 86400000);
 // "Today" is always the Arizona date (America/Phoenix, no DST), never the UTC date
 const today = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Phoenix' }).format(new Date());
-const AZ_OFFSET = '-07:00'; // Arizona midnight as a timestamp: `${date}T00:00:00${AZ_OFFSET}`
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const DAYS   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 const fmtDate  = d => { const [,m,day] = d.split('-'); return `${MONTHS[+m-1]} ${+day}`; };
@@ -544,62 +543,6 @@ function loadPriceLabsFile() {
   catch (e) { console.warn('Could not read PRICELABS_DATA_FILE:', e.message); return null; }
 }
 
-// Write RED/YELLOW pricing alerts to pricing_actions table.
-// Skips windows that already have a pending action today.
-async function savePricingActions(plData, alertData, bookings, todayStr) {
-  if (!SUPABASE_URL || !SUPABASE_KEY || !alertData || !plData) return 0;
-
-  // Fetch existing pending actions created today (Arizona day) to avoid duplicates
-  const sinceToday = encodeURIComponent(`${todayStr}T00:00:00${AZ_OFFSET}`);
-  const existing = await sb(`pricing_actions?status=eq.pending&created_at=gte.${sinceToday}&select=property_id,window_label`);
-  const existingKey = new Set(existing.map(r => `${r.property_id}:${r.window_label}`));
-
-  const toInsert = [];
-  for (const prop of plProps()) {
-    const alerts = computePropertyAlerts(prop, plData, alertData, bookings, todayStr);
-    const settings = alertData[prop.plId]?.settings;
-    const currentBase = settings?.base ?? null;
-
-    for (const a of alerts) {
-      if (a.level !== 'RED' && a.level !== 'YELLOW') continue;
-      if (existingKey.has(`${prop.id}:${a.window}`)) continue;
-
-      const reductionPct = a.level === 'RED' ? 0.15 : 0.10;
-      const recommendedBase = currentBase ? Math.round(currentBase * (1 - reductionPct)) : null;
-
-      toInsert.push({
-        property_id:            prop.id,
-        pricelabs_listing_id:   prop.plId,
-        window_label:           a.window,
-        alert_level:            a.level,
-        current_avg_price:      a.avgPrice,
-        recommended_base_price: recommendedBase,
-        market_median:          a.mktP50,
-        reason:                 a.action,
-        overpriced_dates:       a.overpricedDates,
-        property_occ:           a.propOcc ?? null,
-        market_occ:             a.mktOcc  ?? null,
-        status:                 'pending',
-      });
-    }
-  }
-
-  if (toInsert.length === 0) return 0;
-
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/pricing_actions`, {
-    method: 'POST',
-    headers: {
-      apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=minimal',
-    },
-    body: JSON.stringify(toInsert),
-  });
-  if (!res.ok) throw new Error(`pricing_actions insert ${res.status}: ${await res.text()}`);
-  return toInsert.length;
-}
-
 // Snapshot today's PriceLabs prices to Supabase for historical analysis.
 // Upserts on (property_id, date) — safe to run daily, overwrites with latest data.
 async function snapshotPriceLabsData(plData, capturedAt) {
@@ -724,22 +667,6 @@ function marketCategory(series, seriesName, bedroomCount, propName) {
   return series.Category[fallbackKey];
 }
 
-// Build date → market occupancy rate lookup from neighborhood_data "Future Occ/New/Canc"
-function parseMarketOccupancy(marketData, bedroomCount, propName) {
-  if (!marketData?.data) return {};
-  const foc = marketData.data['Future Occ/New/Canc'];
-  if (!foc?.Category) return {};
-  const category = marketCategory(foc, 'Future Occ/New/Canc', bedroomCount, propName);
-  if (!category) return {};
-  const dates = category.X_values || [];
-  // Future Occ Y_values is double-nested: Y_values[0][0] = actual data array
-  const rawOcc    = (category.Y_values || [])[0];
-  const occSeries = Array.isArray(rawOcc?.[0]) ? rawOcc[0] : (rawOcc || []); // Label[0] = "Occupancy"
-  const map = {};
-  dates.forEach((d, i) => { if (occSeries[i] != null) map[d] = occSeries[i] / 100; });
-  return map;
-}
-
 // Property occupancy for a specific day window, calculated from Supabase bookings
 function propOccFromBookings(bookings, propId, startDay, endDay, todayStr) {
   const occ = occupiedSet(bookings, propId);
@@ -750,34 +677,74 @@ function propOccFromBookings(bookings, propId, startDay, endDay, todayStr) {
   return booked / (endDay - startDay);
 }
 
-// Build date → { p25, p50, p75 } lookup from neighborhood_data for a given bedroom count
+// Market percentiles available from PriceLabs "Future Percentile Prices"
+const PERCENTILES = [25, 50, 75, 90];
+const percentileSeriesLogged = new Set();
+
+// Which Y_values series holds which percentile, matched by the series labels
+// only. Never by position: PriceLabs' real order is 25th, 50th, 75th,
+// Median Booked Price, 90th. Returns null when the labels are missing or
+// don't name all four percentiles.
+function percentileSeriesIndex(series, category, propName) {
+  const nSeries = (category.Y_values || []).length;
+  // The label list is the array of strings, one per Y_values series, on the
+  // category or the series object (key name not relied on)
+  const isLabelList = v => Array.isArray(v) && v.length === nSeries && v.every(x => typeof x === 'string');
+  const labels = [category, series].flatMap(o => Object.values(o || {})).find(isLabelList) || null;
+  const byPct = {};
+  (labels || []).forEach((label, i) => {
+    const m = String(label).match(/\b(25|50|75|90)(?:st|nd|rd|th)?\b/);
+    if (m && !/median booked/i.test(label)) byPct[m[1]] = i;
+  });
+  const complete = PERCENTILES.every(p => byPct[p] != null);
+  if (!percentileSeriesLogged.has(propName)) {
+    percentileSeriesLogged.add(propName);
+    console.log(`  Market percentiles for ${propName}: labels ${JSON.stringify(labels)} → ${complete ? JSON.stringify(byPct) : 'incomplete'}`);
+  }
+  if (!complete) {
+    recordFailure('PriceLabs market data', `${propName}: percentile series labels missing or incomplete (${labels ? labels.join(', ') : 'no labels'}); pricing not checked.`);
+    return null;
+  }
+  return byPct;
+}
+
+// Build date → { p25, p50, p75, p90 } lookup from neighborhood_data for a given bedroom count.
+// null = percentiles couldn't be read (the property is then "not checked").
 function parseMarketPercentiles(marketData, bedroomCount, propName) {
-  if (!marketData?.data) return {};
+  if (!marketData?.data) return null;
   const fpp = marketData.data['Future Percentile Prices'];
   if (!fpp?.Category) {
     recordFailure('PriceLabs market data', `${propName}: no "Future Percentile Prices" in neighborhood data.`);
-    return {};
+    return null;
   }
 
   // Category keys are bedroom counts as strings
   const category = marketCategory(fpp, 'Future Percentile Prices', bedroomCount, propName);
-  if (!category) return {};
+  if (!category) return null;
 
-  const dates   = category.X_values || [];
-  const yVals   = category.Y_values || [];
-  const p25s = yVals[0] || [], p50s = yVals[1] || [], p75s = yVals[2] || [];
+  const dates = category.X_values || [];
+  const yVals = category.Y_values || [];
+  const idx   = percentileSeriesIndex(fpp, category, propName);
+  if (!idx) return null;
 
   const map = {};
   dates.forEach((d, i) => {
-    map[d] = { p25: p25s[i] ?? null, p50: p50s[i] ?? null, p75: p75s[i] ?? null };
+    const point = {};
+    for (const p of PERCENTILES) point[`p${p}`] = (yVals[idx[p]] || [])[i] ?? null;
+    map[d] = point;
   });
   return map;
 }
 
-// Compute alerts for a single property across three windows
+// Compute alerts for a single property across three windows.
+// Alerts only: nothing here recommends or applies a base price.
+// Price position is judged against the property's own target range
+// (properties.price_target_low_pct / price_target_high_pct; default 50th–75th).
+// Returns null when PriceLabs settings or market data are missing, so the
+// caller can say the property couldn't be checked (never "within normal range").
 function computePropertyAlerts(prop, plData, alertData, bookings, todayStr) {
   const propAlertData = alertData?.[prop.plId];
-  if (!propAlertData?.settings || !propAlertData?.market) return [];
+  if (!propAlertData?.settings || !propAlertData?.market) return null;
 
   const { settings, market } = propAlertData;
   if (settings.occupancy_next_30 == null || settings.market_occupancy_next_30 == null) {
@@ -785,17 +752,12 @@ function computePropertyAlerts(prop, plData, alertData, bookings, todayStr) {
   }
   const bedroomCount  = settings.no_of_bedrooms ?? 1;
   const percentiles   = parseMarketPercentiles(market, bedroomCount, prop.name);
-  const mktOccByDate  = parseMarketOccupancy(market, bedroomCount, prop.name);
+  if (!percentiles) return null;
   const prices        = plData?.[prop.plId] ?? {};
   const occ           = occupiedSet(bookings, prop.id); // open nights only — booked nights can't be repriced
-
-  // Market occupancy for days 61-90: average from neighborhood_data occupancy series
-  const mktOcc61_90Dates = [];
-  for (let i = 60; i < 90; i++) mktOcc61_90Dates.push(addDays(todayStr, i));
-  const mktOcc61_90Values = mktOcc61_90Dates.map(d => mktOccByDate[d]).filter(v => v != null);
-  const mktOcc61_90 = mktOcc61_90Values.length
-    ? mktOcc61_90Values.reduce((s, v) => s + v, 0) / mktOcc61_90Values.length
-    : null;
+  const lowKey        = `p${prop.targetLowPct}`;
+  const highKey       = `p${prop.targetHighPct}`;
+  const targetLabel   = `${ordinal(prop.targetLowPct)}–${ordinal(prop.targetHighPct)}`;
 
   const windows = [
     {
@@ -834,15 +796,20 @@ function computePropertyAlerts(prop, plData, alertData, bookings, todayStr) {
     // Use `price` field only — this is the final channel price (what guests see)
     const avgPrice = datesWithPrice.reduce((s, d) => s + prices[d].price, 0) / datesWithPrice.length;
 
-    // Market percentile averages for this window
-    const mktPoints = windowDates.map(d => percentiles[d]).filter(Boolean);
-    if (mktPoints.length === 0) continue;
-    const avgP50 = mktPoints.reduce((s, m) => s + (m.p50 ?? 0), 0) / mktPoints.length;
-    const avgP75 = mktPoints.reduce((s, m) => s + (m.p75 ?? 0), 0) / mktPoints.length;
-    if (!avgP50 || !avgP75) continue;
+    // Market percentile averages for this window, at the property's target range
+    const mktPoints = windowDates.map(d => percentiles[d]).filter(m => m && m[lowKey] != null && m[highKey] != null);
+    if (mktPoints.length === 0) {
+      recordFailure('PriceLabs market data', `${prop.name}: no ${targetLabel} percentile prices for ${win.label.split(' (')[0].toLowerCase()}.`);
+      continue;
+    }
+    const avgLow  = mktPoints.reduce((s, m) => s + m[lowKey], 0) / mktPoints.length;
+    const avgHigh = mktPoints.reduce((s, m) => s + m[highKey], 0) / mktPoints.length;
+    if (!avgLow || !avgHigh) continue;
 
-    const nightsAboveP75 = datesWithPrice.filter(d => prices[d].price > avgP75).length;
-    const pctAboveP75    = nightsAboveP75 / datesWithPrice.length;
+    const highOn = d => percentiles[d]?.[highKey] ?? avgHigh;
+    const nightsAboveHigh = datesWithPrice.filter(d => prices[d].price > highOn(d)).length;
+    const pctAboveHigh    = nightsAboveHigh / datesWithPrice.length;
+    const position = avgPrice > avgHigh ? 'above' : avgPrice < avgLow ? 'below' : 'in';
 
     const propOcc = win.propOcc;
     const mktOcc  = win.mktOcc;
@@ -852,59 +819,61 @@ function computePropertyAlerts(prop, plData, alertData, bookings, todayStr) {
     const occupancyGap        = hasOccData ? mktOcc - propOcc : 0;
     const occupancyHalfMkt    = hasOccData && mktOcc > 0 && propOcc < mktOcc * 0.5;
 
+    // Thresholds measured against the target range instead of the fixed
+    // 50th/75th: RED = >30% of open nights above the range with occupancy
+    // >10 pts behind market, or occupancy under half the market; YELLOW =
+    // >20% of nights above the range, or the average price above the range,
+    // or the average price below the range while occupancy is >10 pts ahead
+    // of market (room to raise). An occupancy gap is only called "not a
+    // price issue" when price isn't above the range; otherwise it's flagged
+    // as overpriced.
     let level = null, reason = null;
-
-    // Do NOT flag if property occupancy is at/above market — correct peak-season behavior
-    if (!occupancyBeatMarket) {
+    if (occupancyBeatMarket) {
+      if (position === 'below' && propOcc - mktOcc > 0.10) { level = 'YELLOW'; reason = 'below_target'; }
+    } else {
       if (hasOccData) {
-        if (occupancyHalfMkt) { level = 'RED'; reason = 'occupancy_gap'; }
-        else if (pctAboveP75 > 0.30 && occupancyGap > 0.10) { level = 'RED'; reason = 'overpriced'; }
+        if (pctAboveHigh > 0.30 && occupancyGap > 0.10) { level = 'RED'; reason = 'overpriced'; }
+        else if (occupancyHalfMkt) { level = 'RED'; reason = position === 'above' ? 'overpriced' : 'occupancy_gap'; }
       }
-      if (!level && pctAboveP75 > 0.20) { level = 'YELLOW'; reason = 'overpriced'; }
-      if (!level && avgP50 > 0 && avgPrice > avgP50 * 1.15) { level = 'YELLOW'; reason = 'above_market'; }
+      if (!level && pctAboveHigh > 0.20) { level = 'YELLOW'; reason = 'overpriced'; }
+      if (!level && position === 'above') { level = 'YELLOW'; reason = 'above_market'; }
     }
-    const ptsAbove = avgP50 > 0 ? Math.round((avgPrice / avgP50 - 1) * 100) : 0;
+
+    const pctVsHigh = Math.round((avgPrice / avgHigh - 1) * 100);
     let action;
     if (!level) {
       action = '✓ Within normal range';
-    } else if (level === 'RED' && reason === 'overpriced') {
-      action = `Reduce pricing now — ${ptsAbove}% above market median with occupancy lagging. Drop base price in PriceLabs before the booking window closes.`;
-    } else if (level === 'RED' && reason === 'occupancy_gap') {
-      action = 'Pricing is in line with market — check listing rank, photos, and reviews on Airbnb/VRBO. Low visibility may be the cause.';
+    } else if (reason === 'below_target') {
+      action = `Priced below target while booking ahead of market (${ordinal(prop.targetLowPct)}–${ordinal(prop.targetHighPct)} target range).`;
+    } else if (reason === 'occupancy_gap') {
+      action = `Price is ${position === 'below' ? 'below' : 'in'} your ${targetLabel} target range — demand is the issue, not price. No price change suggested; check listing rank, photos, and reviews on Airbnb/VRBO.`;
     } else if (reason === 'overpriced') {
-      action = `Reduce prices in PriceLabs for this window — ${nightsAboveP75} of ${datesWithPrice.length} open nights above p75. Act before the booking window closes.`;
+      action = `${nightsAboveHigh} of ${datesWithPrice.length} open nights are above your target range (${ordinal(prop.targetHighPct)} percentile)${level === 'RED' ? ' and occupancy is lagging the market' : ''}. Review these dates in PriceLabs.`;
     } else {
-      action = `Reduce base price in PriceLabs — avg price ${ptsAbove}% above market median. Adjust now to attract advance bookings.`;
+      action = `Average price ${fmt$(avgPrice)} is ${pctVsHigh}% above your ${targetLabel} target range. Review this window in PriceLabs.`;
     }
 
-    const overpricedDates = datesWithPrice
-      .filter(d => prices[d].price > (percentiles[d]?.p75 ?? avgP75))
-      .map(d => ({
-        date:  d,
-        price: Math.round(prices[d].price),
-        p75:   Math.round(percentiles[d]?.p75 ?? avgP75),
-      }));
-
     alerts.push({
-      window: win.label, level: level || 'OK',
+      window: win.label, level: level || 'OK', reason,
       avgPrice: Math.round(avgPrice),
-      mktP50:   Math.round(avgP50),
-      nightsAboveP75, totalNights: datesWithPrice.length,
+      targetLow: Math.round(avgLow), targetHigh: Math.round(avgHigh), targetLabel, position,
+      nightsAboveHigh, totalNights: datesWithPrice.length,
       propOcc: propOcc != null ? Math.round(propOcc * 100) : null,
       mktOcc:  mktOcc  != null ? Math.round(mktOcc  * 100) : null,
       action,
-      overpricedDates,
     });
   }
 
   return alerts;
 }
 
+const ordinal = n => `${n}th`; // only 25, 50, 75, 90 are allowed
+
 function sectionPricingAlerts(plData, alertData, bookings, todayStr) {
   let html = `<h2 id="section-pricing" style="${H2}">🚨 Pricing Alerts</h2>`;
 
   if (!PRICELABS_KEY || !alertData || !plData) {
-    return html + `<p style="color:#888;font-style:italic;font-size:13px;">PriceLabs data required for pricing alerts.</p>`;
+    return html + `<p style="color:#c0392b;font-size:13px;">Pricing alerts couldn't be checked — PriceLabs data is missing. See the alert at the top of this email.</p>`;
   }
 
   const RED_BG = '#fff0f0', RED_COLOR = '#c0392b', RED_BADGE = '#fde8e8';
@@ -913,21 +882,36 @@ function sectionPricingAlerts(plData, alertData, bookings, todayStr) {
 
   // Collect rows for ALL properties × ALL windows (not just alerting ones)
   const allRows = [];
+  const unchecked = [];
   PROPERTIES.forEach((prop, i) => {
     const first = allRows.length;
-    if (!prop.plId) allRows.push({ prop, noListing: true });
-    else computePropertyAlerts(prop, plData, alertData, bookings, todayStr).forEach(a => allRows.push({ prop, ...a }));
+    if (!prop.plId) {
+      allRows.push({ prop, note: 'No PriceLabs listing linked' });
+    } else {
+      const alerts = computePropertyAlerts(prop, plData, alertData, bookings, todayStr);
+      if (alerts === null) {
+        unchecked.push(prop.name);
+        allRows.push({ prop, note: "Couldn't check — PriceLabs settings or market data missing (see the alert at the top)", isError: true });
+      } else {
+        alerts.forEach(a => allRows.push({ prop, ...a }));
+      }
+    }
     if (allRows.length > first) allRows[first].groupRow = groupRow(prop, i, 8);
   });
 
   const redAlerts = allRows.filter(a => a.level === 'RED');
   const ylwAlerts = allRows.filter(a => a.level === 'YELLOW');
 
+  if (unchecked.length) {
+    html += `<div style="padding:6px 12px;background:${RED_BADGE};border-radius:6px;margin-bottom:10px;font-size:12px;color:${RED_COLOR};font-weight:700;">
+      ⚠ ${unchecked.join(' & ')} couldn't be checked today
+    </div>`;
+  }
   if (redAlerts.length) {
     html += `<div style="padding:6px 12px;background:${RED_BADGE};border-radius:6px;margin-bottom:10px;font-size:12px;color:${RED_COLOR};font-weight:700;">
       🔴 ${redAlerts.length} RED alert${redAlerts.length > 1 ? 's' : ''} — immediate attention needed
     </div>`;
-  } else if (ylwAlerts.length === 0) {
+  } else if (ylwAlerts.length === 0 && unchecked.length === 0) {
     html += `<div style="padding:6px 12px;background:#f0faf5;border-radius:6px;margin-bottom:10px;font-size:12px;color:${GRN_COLOR};font-weight:600;">
       ✓ All properties pricing within normal range
     </div>`;
@@ -939,18 +923,20 @@ function sectionPricingAlerts(plData, alertData, bookings, todayStr) {
       <th style="${TH}">Window</th>
       <th style="${TH}text-align:center;">Status</th>
       <th style="${TH}text-align:right;">Avg Price</th>
-      <th style="${TH}text-align:right;">Mkt Median</th>
-      <th style="${TH}text-align:right;">Open Nts &gt;p75</th>
+      <th style="${TH}text-align:right;">Target Range</th>
+      <th style="${TH}text-align:right;">Open Nts Above</th>
       <th style="${TH}text-align:right;">Occ / Mkt</th>
-      <th style="${TH}">Action</th>
+      <th style="${TH}">Note</th>
     </tr>`;
+
+  const POSITION = { above: ['Above', RED_COLOR], in: ['In range', GRN_COLOR], below: ['Below', '#2980b9'] };
 
   for (const a of allRows) {
     html += a.groupRow || '';
-    if (a.noListing) {
+    if (a.note) {
       html += `<tr style="border-bottom:1px solid #f0f0f0;">
         <td style="padding:7px 10px;">${badge(a.prop.name, a.prop.color)}</td>
-        <td colspan="7" style="padding:7px 10px;color:#888;font-style:italic;">No PriceLabs listing linked</td>
+        <td colspan="7" style="padding:7px 10px;${a.isError ? `color:${RED_COLOR};` : 'color:#888;font-style:italic;'}">${a.note}</td>
       </tr>`;
       continue;
     }
@@ -961,20 +947,24 @@ function sectionPricingAlerts(plData, alertData, bookings, todayStr) {
     const levelColor = isRed ? RED_COLOR : isYlw ? YLW_COLOR : GRN_COLOR;
     const levelLabel = isOK ? '✓ OK' : a.level;
     const occStr = a.propOcc != null && a.mktOcc != null ? `${a.propOcc}% / ${a.mktOcc}%` : '—';
+    const [posLabel, posColor] = POSITION[a.position];
     html += `<tr style="background:${rowBg};border-bottom:1px solid #f0f0f0;">
       <td style="padding:7px 10px;">${badge(a.prop.name, a.prop.color)}</td>
       <td style="padding:7px 10px;color:#555;">${a.window}</td>
       <td style="padding:7px 10px;text-align:center;">
         <span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;background:${levelColor}22;color:${levelColor};">${levelLabel}</span>
       </td>
-      <td style="padding:7px 10px;text-align:right;font-weight:600;">${fmt$(a.avgPrice)}</td>
-      <td style="padding:7px 10px;text-align:right;color:#666;">${fmt$(a.mktP50)}</td>
-      <td style="padding:7px 10px;text-align:right;color:#666;">${a.nightsAboveP75} / ${a.totalNights}</td>
+      <td style="padding:7px 10px;text-align:right;font-weight:600;">${fmt$(a.avgPrice)}
+        <div style="font-size:10px;font-weight:600;color:${posColor};">${posLabel}</div></td>
+      <td style="padding:7px 10px;text-align:right;color:#666;">${fmt$(a.targetLow)}–${fmt$(a.targetHigh)}
+        <div style="font-size:10px;color:#aaa;">${a.targetLabel} pct</div></td>
+      <td style="padding:7px 10px;text-align:right;color:#666;">${a.nightsAboveHigh} / ${a.totalNights}</td>
       <td style="padding:7px 10px;text-align:right;color:#666;">${occStr}</td>
       <td style="padding:7px 10px;color:${isOK ? '#888' : '#444'};font-size:11px;">${a.action}</td>
     </tr>`;
   }
-  html += `</table>`;
+  html += `</table>
+  <p style="font-size:11px;color:#aaa;margin:8px 0 0;">Alerts only — nothing here changes prices. Target range = the market percentiles each property aims for (set per property; default 50th–75th). Open nights only.</p>`;
   return html;
 }
 
@@ -1239,30 +1229,28 @@ function computePropertyForecast(prop, paceMonth, todayStr, tyBookings, tyBlocke
 
 // ─── Pricing Intelligence ────────────────────────────────────────────────────
 
-// Returns an urgency note object {text, color, bg} for a given open date, or null if no action needed.
-// Logic: as check-in approaches and/or demand is low, escalate urgency.
-function pricingUrgencyNote(daysOut, demandDesc, currentPrice, minPrice) {
+// Returns a note {text, color, bg} describing an open night as check-in nears
+// (days out, demand, current price), or null. Describes only; never suggests a price.
+function pricingUrgencyNote(daysOut, demandDesc, currentPrice) {
   const isLow  = demandDesc === 'Low Demand';
   const isNorm = demandDesc === 'Normal Demand';
-  const floor  = minPrice || 0;
-  const drop10 = Math.max(floor, Math.round(currentPrice * 0.90));
-  const drop20 = Math.max(floor, Math.round(currentPrice * 0.80));
-  const drop30 = Math.max(floor, Math.round(currentPrice * 0.70));
+  const days   = daysOut === 0 ? 'Tonight' : `${daysOut} day${daysOut !== 1 ? 's' : ''} out`;
+  const price  = fmt$(currentPrice);
 
   if (daysOut <= 3) {
-    return { text: `🔴 Last chance — consider ${fmt$(drop30)}`, color: '#c0392b', bg: '#fef5f5' };
+    return { text: `🔴 ${days}, still open at ${price}`, color: '#c0392b', bg: '#fef5f5' };
   }
   if (daysOut <= 7 && isLow) {
-    return { text: `🔴 7d out, low demand — try ${fmt$(drop20)}`, color: '#c0392b', bg: '#fef5f5' };
+    return { text: `🔴 ${days}, low demand, open at ${price}`, color: '#c0392b', bg: '#fef5f5' };
   }
   if (daysOut <= 7 && isNorm) {
-    return { text: `🟡 7d out — monitor daily`, color: '#e67e22', bg: '#fffbf3' };
+    return { text: `🟡 ${days}, open at ${price}`, color: '#e67e22', bg: '#fffbf3' };
   }
   if (daysOut <= 14 && isLow) {
-    return { text: `🟡 14d out, low demand — consider ${fmt$(drop10)}`, color: '#e67e22', bg: '#fffbf3' };
+    return { text: `🟡 ${days}, low demand, open at ${price}`, color: '#e67e22', bg: '#fffbf3' };
   }
   if (daysOut <= 30 && isLow) {
-    return { text: `👀 30d out, low demand`, color: '#888', bg: '' };
+    return { text: `👀 ${days}, low demand`, color: '#888', bg: '' };
   }
   return null;
 }
@@ -1949,7 +1937,7 @@ function sectionPrices(bookings, plData, todayStr, alertData) {
         const isOverride = r.user_price > 0 && r.user_price !== r.price;
         const isUnbookable = r.unbookable === 1;
         const daysOut = diffDays(todayStr, r.date);
-        const urgencyNote = pricingUrgencyNote(daysOut, r.demand_desc, r.price, liveMinPrice);
+        const urgencyNote = pricingUrgencyNote(daysOut, r.demand_desc, r.price);
         const rowBg = isUnbookable ? '#fffbf3' : urgencyNote?.bg || '';
         html += `<tr style="border-bottom:1px solid #f0f0f0;background:${rowBg}">
           <td style="padding:5px 8px;">${fmtDateL(r.date)}</td>
@@ -2092,21 +2080,21 @@ async function fetchLastBookedDates() {
 }
 
 // Generate the "because" explanation for a pricing alert — used in the Action Board
+// Alerts only: describes where price and occupancy stand; never recommends a base price.
 function alertBecause(a) {
-  const ptsAbove = a.mktP50 > 0 ? Math.round((a.avgPrice / a.mktP50 - 1) * 100) : 0;
-  const occStr   = a.propOcc != null && a.mktOcc != null ? ` Your occupancy ${a.propOcc}% vs market ${a.mktOcc}%.` : '';
-  const isOccGap = a.propOcc != null && a.mktOcc != null && a.mktOcc > 0 && a.propOcc < a.mktOcc * 0.5;
-  if (isOccGap) {
-    return `Pricing is in line with market but occupancy (${a.propOcc}%) is less than half the market rate (${a.mktOcc}%). Check listing visibility, photos, and reviews — the price may not be the issue.`;
+  const occStr = a.propOcc != null && a.mktOcc != null ? ` Your occupancy ${a.propOcc}% vs market ${a.mktOcc}%.` : '';
+  const range  = `${a.targetLabel} target range (${fmt$(a.targetLow)}–${fmt$(a.targetHigh)})`;
+  if (a.reason === 'below_target') {
+    return `Priced below target while booking ahead of market.${occStr}`;
   }
-  if (a.level === 'RED') {
-    return `${a.nightsAboveP75} of ${a.totalNights} nights are above market p75 and occupancy is lagging.${occStr} At ${ptsAbove}% above market median (${fmt$(a.avgPrice)} vs ${fmt$(a.mktP50)}), bookings are going to lower-priced competitors. Reduce base price in PriceLabs now.`;
+  if (a.reason === 'occupancy_gap') {
+    return `Price is ${a.position === 'below' ? 'below' : 'in'} your ${range}, but occupancy (${a.propOcc}%) is less than half the market rate (${a.mktOcc}%). Demand is the issue, not price — check listing visibility, photos, and reviews.`;
   }
-  const pctAbove = Math.round(a.nightsAboveP75 / a.totalNights * 100);
-  if (pctAbove > 20) {
-    return `${a.nightsAboveP75} of ${a.totalNights} nights (${pctAbove}%) are above market p75.${occStr} At ${ptsAbove}% above market median (${fmt$(a.avgPrice)} vs ${fmt$(a.mktP50)}), advance bookings may be softening. Consider a price reduction in PriceLabs.`;
+  if (a.reason === 'overpriced') {
+    const pct = Math.round(a.nightsAboveHigh / a.totalNights * 100);
+    return `${a.nightsAboveHigh} of ${a.totalNights} open nights (${pct}%) are priced above your ${range}${a.level === 'RED' ? ' and occupancy is lagging' : ''}.${occStr} Review these dates in PriceLabs.`;
   }
-  return `Average price ${ptsAbove}% above market median (${fmt$(a.avgPrice)} vs ${fmt$(a.mktP50)}).${occStr} A modest reduction in PriceLabs may improve booking velocity.`;
+  return `Average price ${fmt$(a.avgPrice)} is above your ${range}.${occStr}`;
 }
 
 function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, activity, mtd, tyBookings, lyBookings, paceMonths, hardcodedEvents, cachedEvents, todayStr) {
@@ -2155,8 +2143,18 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
     }
 
     // 2. Pricing alerts with full "because" explanation
-    if (plData && alertData) {
-      for (const a of computePropertyAlerts(prop, plData, alertData, bookings, todayStr)) {
+    // A property PriceLabs couldn't check is flagged, never shown as on track
+    const propAlerts = prop.plId && plData && alertData
+      ? computePropertyAlerts(prop, plData, alertData, bookings, todayStr)
+      : null;
+    if (prop.plId && propAlerts === null) {
+      actions.push({
+        level: 'yellow', anchor: '#section-pricing', sectionLabel: 'Pricing Alerts',
+        text: 'Pricing couldn\'t be checked today — PriceLabs data is missing (see the alert at the top).',
+      });
+    }
+    if (propAlerts) {
+      for (const a of propAlerts) {
         if (a.level === 'OK') continue;
         actions.push({
           level: a.level === 'RED' ? 'red' : 'yellow',
@@ -2398,11 +2396,7 @@ async function main() {
     alertData = await step('PriceLabs settings', fetchPricingAlertData);
   }
 
-  // Save RED/YELLOW alerts to pricing_actions for portal approval workflow
-  if (alertData && plData && !PREVIEW_OUT) {
-    const n = await step('Pricing actions', () => savePricingActions(plData, alertData, bookings, todayStr));
-    if (n != null) console.log(`  ✓ pricing_actions: ${n} new action(s) written`);
-  }
+  // Alerts only: the report no longer writes pricing_actions (Build A, 6.4)
 
   const hardcodedEvents = getHardcodedEvents(todayStr);
   console.log(`  Events: ${hardcodedEvents.length} hardcoded + ${cachedEvents.length} from cache`);

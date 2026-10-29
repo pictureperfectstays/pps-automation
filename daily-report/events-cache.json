@@ -1,6 +1,6 @@
 {
-  "last_updated": "2026-10-26T18:01:19.946Z",
-  "scan_date": "2026-10-26",
+  "last_updated": "2026-10-29T18:15:28.096Z",
+  "scan_date": "2026-10-29",
   "events": [
     {
       "id": "espn-football-nfl-401872991",
@@ -121,40 +121,6 @@
       "venue": "State Farm Stadium",
       "notes": "Home game at State Farm Stadium, Glendale",
       "discovered_at": "2026-05-22T21:04:03.696Z"
-    },
-    {
-      "id": "tm-1A_ZkoMGkd4zbjR",
-      "name": "Blink 180-True (Tribute To Blink182)",
-      "market": "Scottsdale",
-      "start_date": "2026-09-26",
-      "end_date": "2026-09-26",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "1A_ZkoMGkd4zbjR",
-      "category": "Music — Undefined",
-      "venue": "Marquee Theatre",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/blink-180true-tribute-to-blink182-tempe-arizona-09-26-2026/event/19006477D5E1872F",
-      "notes": "",
-      "discovered_at": "2026-06-02T20:41:41.268Z"
-    },
-    {
-      "id": "tm-1A_Zko7GkdFBkwD",
-      "name": "Bilmuri - Kinda Hard Tour",
-      "market": "Scottsdale",
-      "start_date": "2026-09-26",
-      "end_date": "2026-09-26",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "1A_Zko7GkdFBkwD",
-      "category": "Music — Rock",
-      "venue": "The Van Buren",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/bilmuri-kinda-hard-tour-phoenix-arizona-09-26-2026/event/19006444C8E86CBB",
-      "notes": "",
-      "discovered_at": "2026-06-02T20:41:41.268Z"
     },
     {
       "id": "tm-Z7r9jZ1A7x8Ag",
@@ -933,23 +899,6 @@
       "discovered_at": "2026-06-08T15:35:23.425Z"
     },
     {
-      "id": "tm-1A_ZkCAGkdA-a2x",
-      "name": "CODICIADO - Así Es La Vida Tour",
-      "market": "Scottsdale",
-      "start_date": "2026-09-26",
-      "end_date": "2026-09-26",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "1A_ZkCAGkdA-a2x",
-      "category": "Music — Latin",
-      "venue": "Arizona Financial Theatre",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/codiciado-asi-es-la-vida-tour-phoenix-arizona-09-26-2026/event/19006385C58493E2",
-      "notes": "",
-      "discovered_at": "2026-06-11T16:10:29.356Z"
-    },
-    {
       "id": "web-verify-gatlinburg-winterfest-2027",
       "name": "Gatlinburg Winterfest",
       "market": "Sevierville",
@@ -1079,23 +1028,6 @@
       "url": "https://www.ticketmaster.com/madeon-presents-victory-live-18-phoenix-arizona-10-15-2026/event/190064A477614C82",
       "notes": "",
       "discovered_at": "2026-06-15T17:03:35.117Z"
-    },
-    {
-      "id": "tm-17k8v0G6GSqUBNQ",
-      "name": "ISAIAH RASHAD: Lil Sunny's Awful Road Trip",
-      "market": "Scottsdale",
-      "start_date": "2026-09-27",
-      "end_date": "2026-09-27",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "17k8v0G6GSqUBNQ",
-      "category": "Music — Hip-Hop/Rap",
-      "venue": "The Van Buren",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/isaiah-rashad-lil-sunnys-awful-road-phoenix-arizona-09-27-2026/event/190064CCDDDBA8DA",
-      "notes": "",
-      "discovered_at": "2026-06-18T15:35:30.580Z"
     },
     {
       "id": "tm-17k8v0G6GTIGFHu",
@@ -1382,23 +1314,6 @@
       "discovered_at": "2026-06-22T16:41:51.969Z"
     },
     {
-      "id": "tm-G5viZ_udj-iw1",
-      "name": "WWE Presents NXT Live",
-      "market": "Sevierville",
-      "start_date": "2026-09-27",
-      "end_date": "2026-09-27",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "G5viZ_udj-iw1",
-      "category": "Sports — Wrestling",
-      "venue": "Knoxville Civic Coliseum",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/wwe-presents-nxt-live-knoxville-tennessee-09-27-2026/event/1B0064D0DC86CC8A",
-      "notes": "",
-      "discovered_at": "2026-06-22T16:41:47.911Z"
-    },
-    {
       "id": "tm-17k8v0G6u7QIqqx",
       "name": "Ravyn Lenae Presents: Blue Island",
       "market": "Scottsdale",
@@ -1671,23 +1586,6 @@
       "source": "web-search",
       "notes": "Discovered via web search. Source: https://destinationpanamacity.com/annual-events",
       "discovered_at": "2026-07-20T13:51:59.493Z"
-    },
-    {
-      "id": "tm-17k8v0G62o9BseW",
-      "name": "Twin Temple",
-      "market": "Scottsdale",
-      "start_date": "2026-09-28",
-      "end_date": "2026-09-28",
-      "impact": "moderate",
-      "is_watch": false,
-      "source": "ticketmaster",
-      "source_id": "17k8v0G62o9BseW",
-      "category": "Music — Rock",
-      "venue": "The Van Buren",
-      "venue_capacity": null,
-      "url": "https://www.ticketmaster.com/twin-temple-phoenix-arizona-09-28-2026/event/190064F457EB10BD",
-      "notes": "",
-      "discovered_at": "2026-07-23T14:10:18.212Z"
     },
     {
       "id": "tm-17k8v0G6CnTpMHG",
@@ -3224,21 +3122,6 @@
       "venue": "Mountain America Stadium",
       "notes": "Home game at Mountain America Stadium, Tempe",
       "discovered_at": "2026-08-24T12:32:12.776Z"
-    },
-    {
-      "id": "espn-football-college-football-401856704",
-      "name": "Tennessee Volunteers Football vs Texas Longhorns",
-      "market": "Sevierville",
-      "start_date": "2026-09-26",
-      "end_date": "2026-09-26",
-      "impact": "high",
-      "is_watch": false,
-      "source": "espn",
-      "source_id": "401856704",
-      "category": "Sports — Football",
-      "venue": "Neyland Stadium",
-      "notes": "Home game at Neyland Stadium, Knoxville",
-      "discovered_at": "2026-08-24T12:32:13.023Z"
     },
     {
       "id": "espn-football-college-football-401856710",
@@ -6061,6 +5944,52 @@
       "url": "https://www.ticketmaster.com/effin-heartbeats-tour-phoenix-arizona-01-22-2027/event/1900654FB7E069F4",
       "notes": "",
       "discovered_at": "2026-10-26T18:00:41.251Z"
+    },
+    {
+      "id": "tm-1A_Zk4kGkes3bgw",
+      "name": "Dogs In A Pile",
+      "market": "Scottsdale",
+      "start_date": "2027-01-23",
+      "end_date": "2027-01-23",
+      "impact": "moderate",
+      "is_watch": false,
+      "source": "ticketmaster",
+      "source_id": "1A_Zk4kGkes3bgw",
+      "category": "Music — Rock",
+      "venue": "Marquee Theatre",
+      "venue_capacity": null,
+      "url": "https://www.ticketmaster.com/dogs-in-a-pile-tempe-arizona-01-23-2027/event/19006546B1498D72",
+      "notes": "",
+      "discovered_at": "2026-10-29T18:14:47.982Z"
+    },
+    {
+      "id": "tm-1A_Zk4pGkdzzaau",
+      "name": "Pancho Barraza - 35 Aniversario Tour 2027",
+      "market": "Scottsdale",
+      "start_date": "2027-01-23",
+      "end_date": "2027-01-23",
+      "impact": "high",
+      "is_watch": false,
+      "source": "ticketmaster",
+      "source_id": "1A_Zk4pGkdzzaau",
+      "category": "Music — Latin",
+      "venue": "Desert Diamond Arena",
+      "venue_capacity": null,
+      "url": "https://www.ticketmaster.com/pancho-barraza-35-aniversario-tour-2027-glendale-arizona-01-23-2027/event/19006556F8E0924D",
+      "notes": "",
+      "discovered_at": "2026-10-29T18:14:47.982Z"
+    },
+    {
+      "id": "web-discover-upcoming-events-in-panama-city-beach-2026-12-14",
+      "name": "Upcoming Events in Panama City Beach",
+      "market": "Panama City Beach",
+      "start_date": "2026-12-14",
+      "end_date": "2026-12-18",
+      "impact": "high",
+      "is_watch": false,
+      "source": "web-search",
+      "notes": "Discovered via web search. Source: https://majesticbeachresortpcb.com/events",
+      "discovered_at": "2026-10-29T18:15:19.644Z"
     }
   ]
 }

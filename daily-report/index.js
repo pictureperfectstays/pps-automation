@@ -67,21 +67,58 @@ let PROPERTIES = [];
 const PROPERTY_COLOR = { 5: '#668CB3', 6: '#D96666', 7: '#737373', 8: '#65AD89' };
 const EXTRA_COLORS   = ['#8E6BB8', '#C98A3D', '#3D9CA8', '#B8607E', '#6B8E3D'];
 
-// Channel host fees (deducted from your payout)
-// Airbnb: 15.5% host-only fee
-// VRBO/Vrbo: 5% VRBO fee + 3% payment processing = 8%
-// Booking.com: ~18% (confirm exact rate — ranges 15–20%)
-// Direct: 0%
-const CHANNEL_FEE = {
-  'Airbnb':      0.155,
-  'Vrbo':        0.08,
-  'VRBO':        0.08,
-  'HomeAway':    0.08,
-  'Booking.com': 0.18,
-  'Booking':     0.18,
-};
-const channelFee = ch => CHANNEL_FEE[ch] || 0;
-const channelNet = (price, ch) => Math.round(price * (1 - channelFee(ch)));
+// ─── Gap Night Offers ─────────────────────────────────────────────────────────
+
+// Gap night offer = the adjacent guest's own stay rent per night × this
+// (rent only, after rent discounts, no cleaning). Not PriceLabs' price for the
+// open night, which already carries a last-minute discount.
+const GAP_OFFER_FACTOR = 0.75;
+
+// Stripe processing on charges collected outside the channel (Chris's
+// understanding of his rate). Belongs in the portal's payment-flow settings
+// later (Build B); kept here in one place until then.
+const STRIPE_PCT   = 0.029;
+const STRIPE_FIXED = 0.30;
+
+// What you keep from a gap night offer, by the adjacent guest's channel.
+// The stay rate already includes each channel's markup, so no markup math here.
+// offer = rent for the night; tax = tax amount on it (guest pays offer + tax).
+// Returns null when the night isn't offered through that channel.
+// The one place gap-night fee rates live, so Build B can swap the source.
+function gapNetByChannel(offer, tax, channel) {
+  const stripe = STRIPE_PCT * (offer + tax) + STRIPE_FIXED;
+  switch (channelKind(channel)) {
+    case 'airbnb':  return offer * (1 - 0.155);       // special offer through Airbnb, host-only fee
+    case 'vrbo':    return offer - 0.12 * offer - stripe; // night added in OwnerRez: Vrbo 12% of offer + Stripe on the full charge
+    case 'direct':  return offer - stripe;
+    default:        return null;                       // Booking.com and anything unknown: not offered (Build B)
+  }
+}
+
+function channelKind(channel) {
+  const c = (channel || '').toLowerCase();
+  if (c.includes('airbnb')) return 'airbnb';
+  if (c.includes('vrbo') || c.includes('homeaway')) return 'vrbo';
+  if (c.includes('booking.com') || c === 'booking') return 'booking';
+  if (c === '' || c.includes('picture perfect') || c.includes('direct') || c.includes('guesty')) return 'direct';
+  return 'other';
+}
+
+// Insurance-paid stays ("Insurance Claim - …", rent line "Paid by Insurance…")
+// are real bookings and count everywhere except gap offers. Checked before the
+// owner-block logic, so their empty channel never makes them look like a block.
+function isInsuranceStay(b) {
+  if (/^\s*insurance claim/i.test(b.guest_display_name || '')) return true;
+  return (b.charges_json || []).some(c => /paid by insurance/i.test(c.description || ''));
+}
+const isOwnerBlock = b => !isInsuranceStay(b) && b.status === 'blocked';
+
+// Channel as shown in the email
+function channelLabel(b) {
+  if (isInsuranceStay(b)) return 'Insurance';
+  if (b.status === 'blocked') return 'Owner block';
+  return b.booking_channel || 'Direct';
+}
 
 // ─── Date Helpers ─────────────────────────────────────────────────────────────
 
@@ -301,20 +338,22 @@ async function checkYesterdaySent(todayStr) {
 
 async function fetchBookings90(fromDate, toDate) {
   return sb(
-    `bookings?select=id,property_id,guest_display_name,arrival_date,departure_date,nights,gross_revenue,net_revenue,booking_channel,booked_at,charges_json`
+    `bookings?select=id,property_id,status,guest_display_name,arrival_date,departure_date,nights,gross_revenue,net_revenue,booking_channel,booked_at,charges_json`
     + `&property_id=in.(${propIdList()})&status=in.(active,blocked)&arrival_date=lt.${toDate}&departure_date=gt.${fromDate}`
     + `&order=arrival_date.asc`
   );
 }
 
-// Extract rent-per-night from a booking's charges_json
-// This is the OwnerRez base rent (= PriceLabs net target), NOT the marked-up channel price
-function rentPerNight(booking) {
+// A guest's own stay rent per night from charges_json: every line in the rent
+// category (rent plus rent-category discounts such as Early Bird or Weekly),
+// divided by nights. Includes the channel markup (it's in the rent line);
+// excludes cleaning, fees and taxes. null when there's no rent.
+function stayRentPerNight(booking) {
   if (!booking) return null;
   const charges = booking.charges_json || [];
-  const totalRent = charges.filter(c => c.type === 'rent').reduce((s, c) => s + (c.amount || 0), 0);
-  const nights = booking.nights || 1;
-  return totalRent > 0 ? totalRent / nights : null;
+  const rent = charges.filter(c => c.category === 'rent').reduce((s, c) => s + (Number(c.amount) || 0), 0);
+  const nights = booking.nights || Math.max(1, diffDays(booking.arrival_date, booking.departure_date));
+  return rent > 0 ? rent / nights : null;
 }
 
 async function fetchRecentActivity() {
@@ -988,75 +1027,83 @@ function openDates(bookings, propId, from, to) {
   return dates;
 }
 
+// 1-night gaps between two stays (minimum stay is 2 and PriceLabs shrinks the
+// minimum to fit longer gaps, so only 1-night gaps are true orphans).
+// Owner blocks count as stays for finding the gap. Each side is a possible
+// offer: the checkout guest (stay one more night) and the checkin guest
+// (arrive a night early). Owner blocks and insurance stays aren't offered.
+// Returns [{ date, sides: [{ role, booking, guest, channel, rentPerNight, offer }] }]
 function gapNights(bookings, propId, from, to) {
   const sorted = bookings
     .filter(b => b.property_id === propId)
     .sort((a, b) => a.arrival_date.localeCompare(b.arrival_date));
   const gaps = [];
-  for (let i = 0; i < sorted.length - 1; i++) {
-    const gStart = sorted[i].departure_date;
-    const gEnd   = sorted[i + 1].arrival_date;
-    const nights = diffDays(gStart, gEnd);
-    if (nights >= 1 && nights <= 5 && gEnd >= from && gStart <= to) {
-      const dates = [];
-      let d = gStart;
-      while (d < gEnd) { dates.push(d); d = addDays(d, 1); }
-      const prevRPN = rentPerNight(sorted[i]);
-      const nextRPN = rentPerNight(sorted[i+1]);
-      // Use average of adjacent bookings' nightly rate as the gap discount base
-      const baseRPN = (prevRPN && nextRPN) ? (prevRPN + nextRPN) / 2 : (prevRPN || nextRPN);
-      gaps.push({ nights, dates, checkOut: gStart, checkIn: gEnd,
-        prevGuest: sorted[i].guest_display_name, prevChannel: sorted[i].booking_channel,
-        nextGuest: sorted[i+1].guest_display_name, nextChannel: sorted[i+1].booking_channel,
-        baseRentPerNight: baseRPN ? Math.round(baseRPN * 100) / 100 : null,
-      });
+  let prev = null; // stay with the latest departure so far
+  for (const next of sorted) {
+    if (prev && diffDays(prev.departure_date, next.arrival_date) === 1) {
+      const date = prev.departure_date;
+      if (date >= from && date < to) {
+        const sides = [
+          { role: 'checkout', booking: prev },
+          { role: 'checkin',  booking: next },
+        ]
+          .filter(s => !isOwnerBlock(s.booking) && !isInsuranceStay(s.booking))
+          .map(s => {
+            const rentPerNight = stayRentPerNight(s.booking);
+            return {
+              ...s,
+              guest:   (s.booking.guest_display_name || 'Guest').trim(),
+              channel: channelLabel(s.booking),
+              rentPerNight,
+              offer:   rentPerNight != null ? rentPerNight * GAP_OFFER_FACTOR : null,
+            };
+          });
+        if (sides.length) gaps.push({ date, checkOut: prev.departure_date, checkIn: next.arrival_date, sides });
+      }
     }
+    if (!prev || next.departure_date > prev.departure_date) prev = next;
   }
   return gaps;
 }
 
-// Build the discount offer table for a gap night
-// baseRentPerNight = charges_json rent / nights from adjacent booking (= PriceLabs net target)
-// taxRate = total tax rate in effect on the gap night, as a decimal (e.g. 0.1397);
-//           null when the property has no confirmed tax profile
-// prevChannel / nextChannel = booking channels of adjacent guests
-function gapDiscountTable(baseRentPerNight, taxRate, prevChannel, nextChannel) {
-  if (!baseRentPerNight || baseRentPerNight < 0) return '';
-  const tax = taxRate;
-  const channels = [...new Set([prevChannel, nextChannel].filter(Boolean))];
-  const tiers = [20, 25, 30, 35];
-
-  // Column headers — one "Your Net" per unique channel
-  const channelHeaders = channels.map(ch =>
-    `<th style="padding:5px 8px;text-align:right;color:#555;font-weight:600;">Your Net<br><span style="font-weight:400;font-size:10px;">${ch}</span></th>`
-  ).join('');
-
-  let rows = '';
-  for (const pct of tiers) {
-    // Guest's per-night rent after discount (what they pay for rent, excl. taxes)
-    const discountedRent = Math.round(baseRentPerNight * (1 - pct / 100) * 100) / 100;
-    // Total guest pays per gap night including all taxes
-    const guestTotal = tax == null ? null : Math.round(discountedRent * (1 + tax) * 100) / 100;
-    // Chris's net per night from rent (after channel fee, taxes go to authorities)
-    const netCols = channels.map(ch =>
-      `<td style="padding:5px 8px;text-align:right;color:#555;">${fmt$(Math.round(discountedRent * (1 - channelFee(ch))))}</td>`
-    ).join('');
-    const suggested = pct === 25;
-    rows += `<tr style="${suggested ? 'background:#f0f9f4;font-weight:700;' : ''}border-bottom:1px solid #f0f0f0;">
-      <td style="padding:5px 8px;color:${suggested ? '#1a7f5a' : '#333'};">${suggested ? '★ ' : ''}${pct}% off</td>
-      <td style="padding:5px 8px;text-align:right;">${fmt$(discountedRent)}</td>
-      <td style="padding:5px 8px;text-align:right;font-weight:${suggested?'700':'400'};">${fmt$(guestTotal)}</td>
-      ${netCols}
+// Offer table for one gap night: one row per guest who can be offered it.
+// taxRate = total tax rate in effect on the gap night (decimal); null when the
+// property has no confirmed tax profile. plPrice = PriceLabs' current price
+// for the night, shown for reference only.
+function gapOfferTable(gap, taxRate, plPrice) {
+  const cell = 'padding:5px 8px;text-align:right;';
+  const rows = gap.sides.map(s => {
+    if (s.offer == null) {
+      return `<tr style="border-bottom:1px solid #f0f0f0;">
+        <td style="padding:5px 8px;">${s.guest} <span style="color:#888;">(${s.channel}, ${s.role === 'checkout' ? 'stay a night longer' : 'arrive a night early'})</span></td>
+        <td colspan="4" style="padding:5px 8px;color:#aaa;font-style:italic;">No rent on this booking — can't price an offer</td>
+      </tr>`;
+    }
+    const tax   = taxRate == null ? null : s.offer * taxRate;
+    const net   = gapNetByChannel(s.offer, tax ?? 0, s.booking.booking_channel);
+    const netCell = net == null
+      ? `<span style="color:#aaa;font-style:italic;">not offered</span>`
+      : taxRate == null && channelKind(s.booking.booking_channel) !== 'airbnb'
+        ? `${fmt$(net)}<div style="font-size:10px;color:#aaa;">excl. Stripe on tax</div>`
+        : fmt$(net);
+    return `<tr style="border-bottom:1px solid #f0f0f0;">
+      <td style="padding:5px 8px;">${s.guest} <span style="color:#888;">(${s.channel}, ${s.role === 'checkout' ? 'stay a night longer' : 'arrive a night early'})</span></td>
+      <td style="${cell}color:#666;">${fmt$(s.rentPerNight)}</td>
+      <td style="${cell}font-weight:700;color:#1a7f5a;">${fmt$(s.offer)}</td>
+      <td style="${cell}">${tax == null ? '—' : fmt$(s.offer + tax)}</td>
+      <td style="${cell}">${netCell}</td>
     </tr>`;
-  }
-  return `<table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:8px;">
+  }).join('');
+  return `<table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:6px;">
     <tr style="background:#f8f9fa;">
-      <th style="padding:5px 8px;text-align:left;color:#555;font-weight:600;">Offer</th>
-      <th style="padding:5px 8px;text-align:right;color:#555;font-weight:600;">Rent/Night</th>
-      <th style="padding:5px 8px;text-align:right;color:#555;font-weight:600;">Guest Pays<br><span style="font-weight:400;font-size:10px;">${tax == null ? 'tax profile missing' : `incl. ${(tax*100).toFixed(2)}% tax`}</span></th>
-      ${channelHeaders}
+      <th style="padding:5px 8px;text-align:left;color:#555;font-weight:600;">Offer to</th>
+      <th style="padding:5px 8px;text-align:right;color:#555;font-weight:600;">Their Rate/Nt</th>
+      <th style="padding:5px 8px;text-align:right;color:#555;font-weight:600;">Offer<br><span style="font-weight:400;font-size:10px;">25% off</span></th>
+      <th style="padding:5px 8px;text-align:right;color:#555;font-weight:600;">Guest Pays<br><span style="font-weight:400;font-size:10px;">${taxRate == null ? 'tax profile missing' : `incl. ${(taxRate * 100).toFixed(2)}% tax`}</span></th>
+      <th style="padding:5px 8px;text-align:right;color:#555;font-weight:600;">Your Net</th>
     </tr>${rows}
-  </table>`;
+  </table>
+  <div style="font-size:11px;color:#888;margin-top:4px;">PriceLabs price for this night: ${plPrice > 0 ? fmt$(plPrice) : '—'} (reference only)</div>`;
 }
 
 function revenueByProp(rows) {
@@ -1793,7 +1840,7 @@ function sectionActivity({ newBookings, cancellations }) {
       const n = diffDays(b.arrival_date, b.departure_date);
       html += `<div style="padding:6px 0;border-bottom:1px solid #f4f4f4;font-size:13px;">
         <strong>${b.guest_display_name || 'Guest'}</strong>
-        <span style="color:#888;"> · ${p?.name ?? '?'} · ${fmtDate(b.arrival_date)}–${fmtDate(b.departure_date)} (${n}n) · ${b.booking_channel || 'Direct'} · </span>
+        <span style="color:#888;"> · ${p?.name ?? '?'} · ${fmtDate(b.arrival_date)}–${fmtDate(b.departure_date)} (${n}n) · ${channelLabel(b)} · </span>
         <strong style="color:#1a7f5a;">${fmt$(b.gross_revenue)}</strong>
       </div>`;
     }
@@ -1805,7 +1852,7 @@ function sectionActivity({ newBookings, cancellations }) {
       const n = diffDays(b.arrival_date, b.departure_date);
       html += `<div style="padding:6px 0;border-bottom:1px solid #f4f4f4;font-size:13px;">
         <strong>${b.guest_display_name || 'Guest'}</strong>
-        <span style="color:#888;"> · ${p?.name ?? '?'} · ${fmtDate(b.arrival_date)}–${fmtDate(b.departure_date)} (${n}n) · ${b.booking_channel || 'Direct'} · </span>
+        <span style="color:#888;"> · ${p?.name ?? '?'} · ${fmtDate(b.arrival_date)}–${fmtDate(b.departure_date)} (${n}n) · ${channelLabel(b)} · </span>
         <strong style="color:#c0392b;">${fmt$(b.gross_revenue)}</strong>
       </div>`;
     }
@@ -1813,7 +1860,7 @@ function sectionActivity({ newBookings, cancellations }) {
   return html;
 }
 
-function sectionOpenNights(bookings, todayStr, taxProfiles) {
+function sectionOpenNights(bookings, todayStr, taxProfiles, plData) {
   const t30 = addDays(todayStr, 30), t60 = addDays(todayStr, 60), t90 = addDays(todayStr, 90);
   let html = `<h2 id="section-gaps" style="${H2}">📅 Open Nights & Gap Opportunities</h2>`;
 
@@ -1850,25 +1897,16 @@ function sectionOpenNights(bookings, todayStr, taxProfiles) {
 
     if (gaps.length) {
       html += `<div style="margin-top:8px;padding:10px 14px;background:#fff8e1;border-radius:6px;border-left:3px solid #f39c12;">
-        <div style="font-size:12px;font-weight:700;color:#e67e22;margin-bottom:8px;">⚡ Gap Nights — outreach opportunities (${gaps.length})</div>`;
-      for (const g of gaps) {
-        const isLast = gaps.indexOf(g) === gaps.length - 1;
+        <div style="font-size:12px;font-weight:700;color:#e67e22;margin-bottom:8px;">⚡ 1-Night Gaps — outreach opportunities (${gaps.length})</div>`;
+      gaps.forEach((g, gi) => {
+        const isLast = gi === gaps.length - 1;
+        const plPrice = plData?.[p.plId]?.[g.date]?.price;
         html += `<div style="margin-bottom:${isLast ? '0' : '16px'};padding-bottom:${isLast ? '0' : '16px'};border-bottom:${isLast ? 'none' : '1px solid #f0e0a0'};">
-          <div style="font-size:13px;margin-bottom:3px;">
-            <strong>${g.nights === 1 ? '1-night gap' : `${g.nights}-night gap`}:</strong>
-            ${g.dates.map(fmtDateL).join(', ')}
-          </div>
-          <div style="font-size:12px;color:#888;margin-bottom:6px;">
-            ← ${g.prevGuest || 'Guest'} checkout ${fmtDate(g.checkOut)} (${g.prevChannel || 'Direct'})
-            &nbsp;·&nbsp;
-            ${g.nextGuest || 'Guest'} checkin ${fmtDate(g.checkIn)} (${g.nextChannel || 'Direct'}) →
-          </div>
-          ${g.baseRentPerNight
-            ? gapDiscountTable(g.baseRentPerNight, taxRateOn(taxProfiles, p.id, g.dates[0]), g.prevChannel, g.nextChannel)
-            : `<p style="font-size:12px;color:#aaa;font-style:italic;margin:4px 0;">Rent data unavailable for discount calculation</p>`
-          }
+          <div style="font-size:13px;margin-bottom:3px;"><strong>${fmtDateL(g.date)}</strong>
+            <span style="font-size:12px;color:#888;">· between checkout ${fmtDate(g.checkOut)} and checkin ${fmtDate(g.checkIn)}</span></div>
+          ${gapOfferTable(g, taxRateOn(taxProfiles, p.id, g.date), plPrice)}
         </div>`;
-      }
+      });
       html += `</div>`;
     }
     html += `</div>`;
@@ -2192,16 +2230,15 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
       });
     }
 
-    // 5. Gap nights in next 14 days — top one by value + count
+    // 5. 1-night gaps in next 14 days — soonest one + count
     const nearGaps = gapNights(bookings, prop.id, todayStr, t14);
     if (nearGaps.length > 0) {
-      const top  = [...nearGaps].sort((a, b) => ((b.baseRentPerNight || 0) * b.nights) - ((a.baseRentPerNight || 0) * a.nights))[0];
-      const dStr = top.nights === 1 ? fmtDate(top.dates[0]) : `${fmtDate(top.dates[0])}–${fmtDate(top.dates[top.dates.length - 1])}`;
-      const val  = top.baseRentPerNight ? ` ~${fmt$(Math.round(top.baseRentPerNight * top.nights))}` : '';
-      const more = nearGaps.length > 1 ? ` (+${nearGaps.length - 1} more gap${nearGaps.length > 2 ? 's' : ''} this week)` : '';
+      const top    = nearGaps[0];
+      const offers = top.sides.map(s => `${s.guest} (${s.channel}${s.offer != null ? `, offer ${fmt$(s.offer)}` : ''})`).join(' or ');
+      const more   = nearGaps.length > 1 ? ` (+${nearGaps.length - 1} more in the next 14 days)` : '';
       actions.push({
         level: 'gap', anchor: '#section-gaps', sectionLabel: 'Open Nights',
-        text: `${top.nights}-night gap ${dStr}${val} — contact ${top.prevGuest || 'checkout guest'} or ${top.nextGuest || 'checkin guest'} to fill.${more}`,
+        text: `1-night gap ${fmtDateL(top.date)} — offer it to ${offers}.${more}`,
       });
     }
 
@@ -2416,7 +2453,7 @@ async function main() {
     activity  ? sectionActivity(activity) : sectionUnavailable('section-activity', '🔔 Activity — Last 24 Hours'),
     sectionPricingAlerts(plData, alertData, bookings, todayStr),
     sectionSmartEvents(hardcodedEvents, cachedEvents, plData, histActive ?? [], todayStr),
-    sectionOpenNights(bookings, todayStr, taxProfiles),
+    sectionOpenNights(bookings, todayStr, taxProfiles, plData),
     paceData  ? sectionBookingPace(tyBookings, lyBookings, paceMonths, todayStr) : sectionUnavailable('section-pace', '📈 Booking Pace vs Last Year'),
     paceData && forecastData
       ? sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData)

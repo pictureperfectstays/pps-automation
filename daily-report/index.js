@@ -2175,7 +2175,7 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
       if (c.property_id !== prop.id) continue;
       const nights = c.nights || Math.max(1, diffDays(c.arrival_date, c.departure_date));
       actions.push({
-        level: 'red', anchor: '#section-activity', sectionLabel: 'Activity',
+        level: 'red', priority: 2, anchor: '#section-activity', sectionLabel: 'Activity',
         text: `${c.guest_display_name || 'Guest'} cancelled ${fmtDate(c.arrival_date)}–${fmtDate(c.departure_date)} (${nights} night${nights !== 1 ? 's' : ''}, ${fmt$(c.gross_revenue)} lost). Dates are now open — re-list or contact your waitlist.`,
       });
     }
@@ -2187,7 +2187,7 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
       : null;
     if (prop.plId && propAlerts === null) {
       actions.push({
-        level: 'yellow', anchor: '#section-pricing', sectionLabel: 'Pricing Alerts',
+        level: 'yellow', priority: 4, anchor: '#section-pricing', sectionLabel: 'Pricing Alerts',
         text: 'Pricing couldn\'t be checked today — PriceLabs data is missing (see the alert at the top).',
       });
     }
@@ -2196,6 +2196,7 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
         if (a.level === 'OK') continue;
         actions.push({
           level: a.level === 'RED' ? 'red' : 'yellow',
+          priority: a.level === 'RED' ? 1 : 4,
           anchor: '#section-pricing', sectionLabel: 'Pricing Alerts',
           text: `${a.window}: ${alertBecause(a)}`,
         });
@@ -2217,7 +2218,7 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
       seenEvt.add(key);
       const dStr = evt.end_date === evt.start_date ? fmtDate(evt.start_date) : `${fmtDate(evt.start_date)}–${fmtDate(evt.end_date)}`;
       actions.push({
-        level: 'event', anchor: '#section-events', sectionLabel: 'Events',
+        level: 'event', priority: 3, anchor: '#section-events', sectionLabel: 'Events',
         text: `${evt.name} ${dStr} (${(evt.impact || '').replace('-', ' ')} impact) — verify pricing is elevated for these dates.`,
       });
     }
@@ -2225,7 +2226,7 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
     // 4. No new bookings in >21 days with open nights
     if (plData && daysSince != null && daysSince >= 21 && openNext30 > 0) {
       actions.push({
-        level: 'watch', anchor: '#section-pricing', sectionLabel: 'Pricing',
+        level: 'watch', priority: 5, anchor: '#section-pricing', sectionLabel: 'Pricing',
         text: `No new bookings in ${daysSince} days with ${openNext30} open night${openNext30 !== 1 ? 's' : ''} available in the next 30 days. Check listing rank, photos, and reviews across all channels.`,
       });
     }
@@ -2237,7 +2238,7 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
       const offers = top.sides.map(s => `${s.guest} (${s.channel}${s.offer != null ? `, offer ${fmt$(s.offer)}` : ''})`).join(' or ');
       const more   = nearGaps.length > 1 ? ` (+${nearGaps.length - 1} more in the next 14 days)` : '';
       actions.push({
-        level: 'gap', anchor: '#section-gaps', sectionLabel: 'Open Nights',
+        level: 'gap', priority: 3, anchor: '#section-gaps', sectionLabel: 'Open Nights',
         text: `1-night gap ${fmtDateL(top.date)} — offer it to ${offers}.${more}`,
       });
     }
@@ -2250,7 +2251,7 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
     if (lyRev > 200 && tyRev < lyRev * 0.80) {
       const pct = Math.round((1 - tyRev / lyRev) * 100);
       actions.push({
-        level: 'watch', anchor: '#section-pace', sectionLabel: 'Booking Pace',
+        level: 'watch', priority: 6, anchor: '#section-pace', sectionLabel: 'Booking Pace',
         text: `${pm.label} bookings are ${pct}% behind last year (${fmt$(Math.round(tyRev))} vs ${fmt$(Math.round(lyRev))}). Consider a promotion or price adjustment to stimulate demand.`,
       });
     }
@@ -2273,7 +2274,19 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
   return { summaries, portfolioNote };
 }
 
+// The board shows the top BOARD_LIMIT items across all properties by priority
+// (ties keep property order, then the order items were added). Card status
+// still reflects every item, shown or not.
+const BOARD_LIMIT = 10;
+
 function sectionPriorityBoard({ summaries, portfolioNote }, todayStr) {
+  const shown = new Set(
+    summaries.flatMap(s => s.actions)
+      .map((a, i) => ({ a, i }))
+      .sort((x, y) => (x.a.priority ?? 9) - (y.a.priority ?? 9) || x.i - y.i)
+      .slice(0, BOARD_LIMIT)
+      .map(x => x.a)
+  );
   const boldDollars = str => str.replace(/\$[\d,]+(?:\.\d+)?/g, m => `<strong>${m}</strong>`);
 
   const STATUS = {
@@ -2298,13 +2311,18 @@ function sectionPriorityBoard({ summaries, portfolioNote }, todayStr) {
     if (actions.length === 0) {
       body = `<div style="padding:10px 14px;font-size:13px;color:#1a7f5a;">✓ No actions needed today.</div>`;
     } else {
-      const rows = actions.map((a, i) => {
+      const top  = actions.filter(a => shown.has(a));
+      const rest = actions.length - top.length;
+      const rows = top.map((a, i) => {
         const c    = ACTION_COLOR[a.level] || '#555';
         const jump = `<a href="${a.anchor}" style="font-size:11px;color:#406A94;text-decoration:none;font-weight:600;margin-left:10px;white-space:nowrap;">↓ ${a.sectionLabel}</a>`;
-        const sep  = i < actions.length - 1 ? 'border-bottom:1px solid #f3f4f6;' : '';
+        const sep  = i < top.length - 1 || rest ? 'border-bottom:1px solid #f3f4f6;' : '';
         return `<div style="padding:8px 0;${sep}font-size:13px;line-height:1.5;color:${c};">→ ${boldDollars(a.text)}${jump}</div>`;
       }).join('');
-      body = `<div style="padding:4px 14px 10px;">${rows}</div>`;
+      const more = rest
+        ? `<div style="padding:8px 0;font-size:12px;color:#888;">${prop.name}: ${rest} more item${rest !== 1 ? 's' : ''} (see the sections below)</div>`
+        : '';
+      body = `<div style="padding:4px 14px 10px;">${rows}${more}</div>`;
     }
     return `${heading}<div style="margin-bottom:10px;border-radius:8px;overflow:hidden;border:1px solid ${s.cardBorder};border-left:4px solid ${s.border};">${header}${syn}${body}</div>`;
   }).join('');

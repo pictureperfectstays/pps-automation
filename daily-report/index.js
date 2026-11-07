@@ -460,6 +460,8 @@ function taxRateOn(taxProfiles, propId, date) {
 // so it should never be more than 4 days old; 6 allows one missed scan.
 const EVENTS_CACHE_MAX_AGE_DAYS = 6;
 
+const JUNK_EVENT_NAME = /^\s*events from\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b/i;
+
 function fetchEventsCache(todayStr) {
   try {
     const cachePath = join(__dirname, 'events-cache.json');
@@ -472,7 +474,11 @@ function fetchEventsCache(todayStr) {
     if (!scanDate || diffDays(scanDate, todayStr) > EVENTS_CACHE_MAX_AGE_DAYS) {
       recordWarning('Events cache', `Last event scan was ${scanDate ? fmtDate(scanDate) : 'never'}; Ticketmaster and ESPN events may be out of date. Check the Event Discovery Scan workflow.`);
     }
-    return data.events || [];
+    // Web-search entries named after a listing page ("Events from July 9") aren't events
+    const events = (data.events || []).filter(ev => !JUNK_EVENT_NAME.test(ev.name || ''));
+    const junk = (data.events || []).length - events.length;
+    if (junk) console.log(`  Events cache: skipped ${junk} listing-page entr${junk !== 1 ? 'ies' : 'y'} ("Events from [date]")`);
+    return events;
   } catch (e) {
     recordFailure('Events cache', `events-cache.json could not be read (${e.message}); only hard-coded events are shown.`);
     return [];
@@ -1618,6 +1624,45 @@ const IMPACT_LABEL = {
   'watch':        '⚠ Watch',
 };
 
+// Historical ADR for an event's dates and the current PriceLabs average over them
+function eventPricing(ev, prop, plData, histActive, cutoff90) {
+  const hist = histActive ? computeEventADR(ev, histActive, prop.id) : null;
+  let currentAvgPrice = null;
+  if (plData?.[prop.plId]) {
+    const prices = plData[prop.plId];
+    const pricedDates = [];
+    let d = ev.start_date;
+    while (d <= ev.end_date && d <= cutoff90) {
+      if (prices[d]?.price > 0) pricedDates.push(prices[d].price);
+      d = addDays(d, 1);
+    }
+    if (pricedDates.length) {
+      currentAvgPrice = pricedDates.reduce((s, v) => s + v, 0) / pricedDates.length;
+    }
+  }
+  return { hist, currentAvgPrice };
+}
+
+// Events in the next 90 days as the Events table lists them: deduped by id,
+// Ticketmaster events only at high/very-high impact
+function upcomingEvents90(hardcodedEvents, cachedEvents, todayStr) {
+  const cutoff90 = addDays(todayStr, 90);
+  const byId = new Map();
+  for (const ev of [...hardcodedEvents, ...cachedEvents]) if (!byId.has(ev.id)) byId.set(ev.id, ev);
+  return [...byId.values()].filter(ev =>
+    ev.end_date >= todayStr && ev.start_date <= cutoff90
+    && !(ev.source === 'ticketmaster' && ev.impact !== 'high' && ev.impact !== 'very-high'));
+}
+
+// "Potentially underpriced" in the Events table: not a slow-season watch period,
+// and the PriceLabs average is more than 10% below historical ADR
+function eventUnderpricedPct(ev, prop, plData, histActive, todayStr) {
+  if (ev.is_watch) return null;
+  const { hist, currentAvgPrice } = eventPricing(ev, prop, plData, histActive, addDays(todayStr, 90));
+  if (!hist || !currentAvgPrice || currentAvgPrice >= hist.adr * 0.90) return null;
+  return { pct: Math.round((1 - currentAvgPrice / hist.adr) * 100), adr: hist.adr };
+}
+
 function sectionSmartEvents(hardcodedEvents, cachedEvents, plData, histActive, todayStr) {
   let html = `<h2 id="section-events" style="${H2}">📍 Smart Event Detection</h2>`;
 
@@ -1685,23 +1730,7 @@ function sectionSmartEvents(hardcodedEvents, cachedEvents, plData, histActive, t
 
       const isNew = ev.discovered_at && ev.discovered_at.slice(0, 10) >= sevenDaysAgo;
 
-      // Historical ADR
-      const hist = computeEventADR(ev, histActive, prop.id);
-
-      // Current PriceLabs avg price over these dates
-      let currentAvgPrice = null;
-      if (plData?.[prop.plId]) {
-        const prices = plData[prop.plId];
-        const pricedDates = [];
-        let d = ev.start_date;
-        while (d <= ev.end_date && d <= cutoff90) {
-          if (prices[d]?.price > 0) pricedDates.push(prices[d].price);
-          d = addDays(d, 1);
-        }
-        if (pricedDates.length) {
-          currentAvgPrice = pricedDates.reduce((s, v) => s + v, 0) / pricedDates.length;
-        }
-      }
+      const { hist, currentAvgPrice } = eventPricing(ev, prop, plData, histActive, cutoff90);
 
       // Alert logic
       let alertLevel = null; // 'red' | 'amber' | 'green' | 'info'
@@ -1723,7 +1752,7 @@ function sectionSmartEvents(hardcodedEvents, cachedEvents, plData, histActive, t
       } else if (!hist) {
         alertLevel = 'info';
         alertText  = 'No prior-year data — first occurrence or insufficient history. Monitor closely.';
-      } else if (currentAvgPrice && currentAvgPrice < hist.adr * 0.90) {
+      } else if (currentAvgPrice && currentAvgPrice < hist.adr * 0.90) { // same test as eventUnderpricedPct
         const pctBelow = Math.round((1 - currentAvgPrice / hist.adr) * 100);
         alertLevel = 'red';
         alertText  = `Potentially underpriced by ${pctBelow}%. Historical ADR was ${fmt$(Math.round(hist.adr))} — consider raising prices in PriceLabs before guests find this gap.`;
@@ -2136,10 +2165,9 @@ function alertBecause(a) {
   return `Average price ${fmt$(a.avgPrice)} is above your ${range}.${occStr}`;
 }
 
-function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, activity, mtd, tyBookings, lyBookings, paceMonths, hardcodedEvents, cachedEvents, todayStr) {
+function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, activity, mtd, tyBookings, lyBookings, paceMonths, hardcodedEvents, cachedEvents, histActive, todayStr) {
   const now = new Date();
   const t14 = addDays(todayStr, 14);
-  const t30 = addDays(todayStr, 30);
 
   const summaries = [];
 
@@ -2169,9 +2197,11 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
     const synopsis = synParts.join(' · ');
 
     // ── Action items ─────────────────────────────────────────────────────────
+    // Priority (1 = first): 1 failures · 2 cancellations · 3 1-night gaps (14 days)
+    // · 4 RED pricing · 5 YELLOW pricing · 6 no recent bookings · 7 pace · 8 underpriced events
     const actions = [];
 
-    // 1. Cancellations for this property in last 24h
+    // Cancellations for this property in last 24h
     for (const c of (activity.cancellations || [])) {
       if (c.property_id !== prop.id) continue;
       const nights = c.nights || Math.max(1, diffDays(c.arrival_date, c.departure_date));
@@ -2181,14 +2211,14 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
       });
     }
 
-    // 2. Pricing alerts with full "because" explanation
-    // A property PriceLabs couldn't check is flagged, never shown as on track
+    // Pricing alerts with full "because" explanation
+    // A property PriceLabs couldn't check is flagged (a failure), never shown as on track
     const propAlerts = prop.plId && plData && alertData
       ? computePropertyAlerts(prop, plData, alertData, bookings, todayStr)
       : null;
     if (prop.plId && propAlerts === null) {
       actions.push({
-        level: 'yellow', priority: 4, anchor: '#section-pricing', sectionLabel: 'Pricing Alerts',
+        level: 'yellow', priority: 1, anchor: '#section-pricing', sectionLabel: 'Pricing Alerts',
         text: 'Pricing couldn\'t be checked today — PriceLabs data is missing (see the alert at the top).',
       });
     }
@@ -2197,42 +2227,35 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
         if (a.level === 'OK') continue;
         actions.push({
           level: a.level === 'RED' ? 'red' : 'yellow',
-          priority: a.level === 'RED' ? 1 : 4,
+          priority: a.level === 'RED' ? 4 : 5,
           anchor: '#section-pricing', sectionLabel: 'Pricing Alerts',
           text: `${a.window}: ${alertBecause(a)}`,
         });
       }
     }
 
-    // 3. HIGH/VERY-HIGH events in next 30 days for this property
-    // Suppress generic "Peak Season" events when a pricing alert already covers the analysis —
-    // showing "elevate prices" alongside "you're above market, reduce prices" is contradictory.
-    const hasPricingAlert = actions.some(a => a.level === 'red' || a.level === 'yellow');
-    const seenEvt = new Set();
-    for (const evt of [...hardcodedEvents, ...cachedEvents]) {
-      if (evt.end_date < todayStr || evt.start_date > t30) continue;
-      if (!['high', 'very-high'].includes((evt.impact || '').toLowerCase())) continue;
-      if (prop.market !== evt.market) continue;
-      if (hasPricingAlert && /peak season/i.test(evt.name)) continue;
-      const key = `${evt.name}|${evt.start_date}`;
-      if (seenEvt.has(key)) continue;
-      seenEvt.add(key);
-      const dStr = evt.end_date === evt.start_date ? fmtDate(evt.start_date) : `${fmtDate(evt.start_date)}–${fmtDate(evt.end_date)}`;
+    // Events stay in the Events section; only ones flagged underpriced there come
+    // onto the board (no jump link: anchors don't work reliably in email)
+    for (const ev of upcomingEvents90(hardcodedEvents, cachedEvents, todayStr)) {
+      if (ev.market !== prop.market) continue;
+      const under = eventUnderpricedPct(ev, prop, plData, histActive, todayStr);
+      if (!under) continue;
+      const dStr = ev.end_date === ev.start_date ? fmtDate(ev.start_date) : `${fmtDate(ev.start_date)}–${fmtDate(ev.end_date)}`;
       actions.push({
-        level: 'event', priority: 3, anchor: '#section-events', sectionLabel: 'Events',
-        text: `${evt.name} ${dStr} (${(evt.impact || '').replace('-', ' ')} impact) — verify pricing is elevated for these dates.`,
+        level: 'event', priority: 8, anchor: null,
+        text: `${ev.name} ${dStr}: priced ${under.pct}% below its historical ADR of ${fmt$(Math.round(under.adr))} — consider raising prices in PriceLabs.`,
       });
     }
 
-    // 4. No new bookings in >21 days with open nights
+    // No new bookings in >21 days with open nights
     if (plData && daysSince != null && daysSince >= 21 && openNext30 > 0) {
       actions.push({
-        level: 'watch', priority: 5, anchor: '#section-pricing', sectionLabel: 'Pricing',
+        level: 'watch', priority: 6, anchor: '#section-pricing', sectionLabel: 'Pricing',
         text: `No new bookings in ${daysSince} days with ${openNext30} open night${openNext30 !== 1 ? 's' : ''} available in the next 30 days. Check listing rank, photos, and reviews across all channels.`,
       });
     }
 
-    // 5. 1-night gaps in next 14 days — soonest one + count
+    // 1-night gaps in next 14 days — soonest one + count
     const nearGaps = gapNights(bookings, prop.id, todayStr, t14);
     if (nearGaps.length > 0) {
       const top    = nearGaps[0];
@@ -2244,7 +2267,7 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
       });
     }
 
-    // 6. Booking pace >20% behind LY for first pace month
+    // Booking pace >20% behind LY for first pace month
     const pm = paceMonths[0];
     let tyRev = 0, lyRev = 0;
     for (const b of tyBookings) { if (b.property_id === prop.id) tyRev += prorateToMonth(b, pm.start, pm.end).revenue; }
@@ -2252,7 +2275,7 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
     if (lyRev > 200 && tyRev < lyRev * 0.80) {
       const pct = Math.round((1 - tyRev / lyRev) * 100);
       actions.push({
-        level: 'watch', priority: 6, anchor: '#section-pace', sectionLabel: 'Booking Pace',
+        level: 'watch', priority: 7, anchor: '#section-pace', sectionLabel: 'Booking Pace',
         text: `${pm.label} bookings are ${pct}% behind last year (${fmt$(Math.round(tyRev))} vs ${fmt$(Math.round(lyRev))}). Consider a promotion or price adjustment to stimulate demand.`,
       });
     }
@@ -2312,11 +2335,11 @@ function sectionPriorityBoard({ summaries, portfolioNote }, todayStr) {
     if (actions.length === 0) {
       body = `<div style="padding:10px 14px;font-size:13px;color:#1a7f5a;">✓ No actions needed today.</div>`;
     } else {
-      const top  = actions.filter(a => shown.has(a));
+      const top  = actions.filter(a => shown.has(a)).sort((x, y) => x.priority - y.priority);
       const rest = actions.length - top.length;
       const rows = top.map((a, i) => {
         const c    = ACTION_COLOR[a.level] || '#555';
-        const jump = `<a href="${a.anchor}" style="font-size:11px;color:#406A94;text-decoration:none;font-weight:600;margin-left:10px;white-space:nowrap;">↓ ${a.sectionLabel}</a>`;
+        const jump = !a.anchor ? '' : `<a href="${a.anchor}" style="font-size:11px;color:#406A94;text-decoration:none;font-weight:600;margin-left:10px;white-space:nowrap;">↓ ${a.sectionLabel}</a>`;
         const sep  = i < top.length - 1 || rest ? 'border-bottom:1px solid #f3f4f6;' : '';
         return `<div style="padding:8px 0;${sep}font-size:13px;line-height:1.5;color:${c};">→ ${boldDollars(a.text)}${jump}</div>`;
       }).join('');
@@ -2462,7 +2485,7 @@ async function main() {
   const { summaries, portfolioNote } = buildPropertySummaries(
     plData, alertData, bookings, lastBookedMap,
     activity ?? { newBookings: [], cancellations: [] }, mtd,
-    tyBookings ?? [], lyBookings ?? [], paceMonths, hardcodedEvents, cachedEvents, todayStr);
+    tyBookings ?? [], lyBookings ?? [], paceMonths, hardcodedEvents, cachedEvents, histActive, todayStr);
   const priorityBoardHtml = sectionPriorityBoard({ summaries, portfolioNote }, todayStr);
   const totalActions = summaries.reduce((n, s) => n + s.actions.length, 0);
   console.log(`  ✓ Priority Action Board: ${totalActions} action items across ${summaries.length} properties`);

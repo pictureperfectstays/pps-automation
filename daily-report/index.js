@@ -2236,14 +2236,29 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
 
     // Events stay in the Events section; only ones flagged underpriced there come
     // onto the board (no jump link: anchors don't work reliably in email)
+    // One item per property: an entry per night (or date span), events on the same
+    // night combined, soonest first. Items rank among themselves by soonest night.
+    const underByNight = new Map(); // "start|end" → { start, end, names, pct }
     for (const ev of upcomingEvents90(hardcodedEvents, cachedEvents, todayStr)) {
       if (ev.market !== prop.market) continue;
       const under = eventUnderpricedPct(ev, prop, plData, histActive, todayStr);
       if (!under) continue;
-      const dStr = ev.end_date === ev.start_date ? fmtDate(ev.start_date) : `${fmtDate(ev.start_date)}–${fmtDate(ev.end_date)}`;
+      const key = `${ev.start_date}|${ev.end_date}`;
+      const e = underByNight.get(key) ?? { start: ev.start_date, end: ev.end_date, names: [], pct: 0 };
+      if (!e.names.includes(ev.name)) e.names.push(ev.name);
+      e.pct = Math.max(e.pct, under.pct);
+      underByNight.set(key, e);
+    }
+    if (underByNight.size) {
+      const nightOf = e => (e.start < todayStr ? todayStr : e.start);
+      const entries = [...underByNight.values()].sort((a, b) => nightOf(a).localeCompare(nightOf(b)) || a.end.localeCompare(b.end));
+      const list = entries.map(e => {
+        const dStr = e.end === e.start ? fmtDate(e.start) : `${fmtDate(e.start)}–${fmtDate(e.end)}`;
+        return `${dStr} ${e.names.join(', ')} (−${e.pct}%)`;
+      }).join('; ');
       actions.push({
-        level: 'event', priority: 8, anchor: null,
-        text: `${ev.name} ${dStr}: priced ${under.pct}% below its historical ADR of ${fmt$(Math.round(under.adr))} — consider raising prices in PriceLabs.`,
+        level: 'event', priority: 8, sortKey: nightOf(entries[0]), anchor: null,
+        text: `Event nights priced below their historical ADR: ${list}. Consider raising prices in PriceLabs; see Events.`,
       });
     }
 
@@ -2299,7 +2314,8 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
 }
 
 // The board shows the top BOARD_LIMIT items across all properties by priority
-// (ties keep property order, then the order items were added). Card status
+// (ties by sortKey where set, e.g. soonest event night, then property order and
+// the order items were added). Card status
 // still reflects every item, shown or not.
 const BOARD_LIMIT = 10;
 
@@ -2307,7 +2323,8 @@ function sectionPriorityBoard({ summaries, portfolioNote }, todayStr) {
   const shown = new Set(
     summaries.flatMap(s => s.actions)
       .map((a, i) => ({ a, i }))
-      .sort((x, y) => (x.a.priority ?? 9) - (y.a.priority ?? 9) || x.i - y.i)
+      .sort((x, y) => (x.a.priority ?? 9) - (y.a.priority ?? 9)
+        || (x.a.sortKey ?? '').localeCompare(y.a.sortKey ?? '') || x.i - y.i)
       .slice(0, BOARD_LIMIT)
       .map(x => x.a)
   );

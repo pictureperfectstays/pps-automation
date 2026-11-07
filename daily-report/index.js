@@ -336,10 +336,11 @@ async function checkYesterdaySent(todayStr) {
 
 // ─── Data Fetching ────────────────────────────────────────────────────────────
 
+// departure gte today: a guest checking out today is the checkout side of tonight's gap
 async function fetchBookings90(fromDate, toDate) {
   return sb(
     `bookings?select=id,property_id,status,guest_display_name,arrival_date,departure_date,nights,gross_revenue,net_revenue,booking_channel,booked_at,charges_json`
-    + `&property_id=in.(${propIdList()})&status=in.(active,blocked)&arrival_date=lt.${toDate}&departure_date=gt.${fromDate}`
+    + `&property_id=in.(${propIdList()})&status=in.(active,blocked)&arrival_date=lt.${toDate}&departure_date=gte.${fromDate}`
     + `&order=arrival_date.asc`
   );
 }

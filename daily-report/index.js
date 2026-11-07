@@ -161,6 +161,45 @@ function getPaceMonths(todayStr) {
   });
 }
 
+// Cancellation dates are real only after this day. The Dec 30 2025 and Jan 12 2026
+// groups were imported already cancelled (OwnerRez created = canceled timestamp),
+// so for those we can't tell when they were cancelled.
+const CANCELED_AT_TRUSTED_AFTER = '2026-01-12';
+const canceledAtTrusted = b => !!b.canceled_at && b.canceled_at.slice(0, 10) > CANCELED_AT_TRUSTED_AFTER;
+
+// Was this booking on the books at `snapshot` (ISO timestamp)? Active bookings made
+// by then, plus bookings cancelled after it (only when the cancel date is trusted).
+function onBooksAt(b, snapshot) {
+  const at = Date.parse(snapshot);
+  if (!b.booked_at || Date.parse(b.booked_at) > at) return false;
+  if (b.status === 'active') return true;
+  return b.status === 'canceled' && canceledAtTrusted(b) && Date.parse(b.canceled_at) > at;
+}
+
+// A booking as it stood at a past snapshot: a later-cancelled booking carries its
+// last active gross (null when the portal didn't record it: amountMissing).
+function asItStood(b) {
+  if (b.status !== 'canceled') return b;
+  return { ...b, gross_revenue: b.last_active_gross ?? 0, amountMissing: b.last_active_gross == null };
+}
+
+// Arizona end of a date, as a timestamp PostgREST and string compares both accept
+const azEndOfDay = d => `${d}T23:59:59-07:00`;
+const isoAt = ms => new Date(ms).toISOString();
+
+// Last-year comparisons start the first full month after a property's first stay
+// (a property whose first arrival is the 1st has that month as its first full month)
+function firstFullMonth(firstArrival) {
+  if (!firstArrival) return null;
+  return firstArrival.slice(8, 10) === '01' ? isoMonthStart(firstArrival) : addMonths(isoMonthStart(firstArrival), 1);
+}
+const addMonths = (monthStart, n) => {
+  const [y, m] = monthStart.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1 + n, 1)).toISOString().slice(0, 10);
+};
+// Does the property have a comparable prior year for a period starting at lyStart?
+const hasPriorYear = (prop, lyStart) => !prop.firstFullMonth || lyStart >= prop.firstFullMonth;
+
 // Prorate a booking's gross_revenue and nights into the overlap with [monthStart, monthEnd)
 function prorateToMonth(booking, monthStart, monthEnd) {
   const arrival       = booking.arrival_date;
@@ -357,59 +396,113 @@ function stayRentPerNight(booking) {
   return rent > 0 ? rent / nights : null;
 }
 
+const CANCEL_SELECT = 'id,property_id,status,guest_display_name,arrival_date,departure_date,nights,gross_revenue,booking_channel,booked_at,canceled_at,last_active_gross,charges_json';
+
 async function fetchRecentActivity() {
   const since = new Date(Date.now() - 25 * 3600 * 1000).toISOString();
   const ids = propIdList();
-  const [newBookings, cancellations] = await Promise.all([
-    sb(`bookings?select=id,property_id,guest_display_name,arrival_date,departure_date,nights,gross_revenue,booking_channel,booked_at&property_id=in.(${ids})&status=eq.active&booked_at=gte.${since}&order=booked_at.desc`),
-    sb(`bookings?select=id,property_id,guest_display_name,arrival_date,departure_date,nights,gross_revenue,booking_channel,updated_at&property_id=in.(${ids})&status=eq.canceled&updated_at=gte.${since}&order=updated_at.desc`),
+  const [newBookings, cancelled] = await Promise.all([
+    sb(`bookings?select=id,property_id,status,guest_display_name,arrival_date,departure_date,nights,gross_revenue,booking_channel,booked_at,charges_json&property_id=in.(${ids})&status=eq.active&booked_at=gte.${since}&order=booked_at.desc`),
+    sb(`bookings?select=${CANCEL_SELECT}&property_id=in.(${ids})&status=eq.canceled&canceled_at=gte.${since}&order=canceled_at.desc`),
   ]);
+  // Rebooked: active stays now on any of the cancelled nights, prorated to those nights
+  const cancellations = await Promise.all(cancelled.map(async c => {
+    const over = await sb(`bookings?select=id,guest_display_name,arrival_date,departure_date,nights,gross_revenue&property_id=eq.${c.property_id}&status=eq.active&arrival_date=lt.${c.departure_date}&departure_date=gt.${c.arrival_date}`);
+    let rebookedNights = 0, rebookedGross = 0;
+    for (const b of over) {
+      const { revenue, nights } = prorateToMonth(b, c.arrival_date, c.departure_date);
+      rebookedNights += nights; rebookedGross += revenue;
+    }
+    return { ...c, rebookedNights, rebookedGross };
+  }));
   return { newBookings, cancellations };
 }
 
+// MTD split by night, gross, same rule as the portal dashboard
+// (dashboard.js:1131-1158): each night of a stay counts gross / nights, and
+// bookings at $0 or less are dropped. This month and the same month last year.
 async function fetchMTDRevenue(todayStr) {
   const thisStart = isoMonthStart(todayStr);
-  const lyToday   = addDays(todayStr, -365);
-  const lyStart   = isoMonthStart(lyToday);
+  const thisEnd   = addMonths(thisStart, 1);
+  const lyStart   = addMonths(thisStart, -12);
+  const lyEnd     = addMonths(lyStart, 1);
+  const lyCut     = addDays(lyStart, diffDays(thisStart, todayStr)); // same nights last year
   const ids       = propIdList();
-  const [cur, ly] = await Promise.all([
-    sb(`bookings?select=property_id,gross_revenue,net_revenue,nights&property_id=in.(${ids})&status=eq.active&arrival_date=gte.${thisStart}&arrival_date=lte.${todayStr}`),
-    sb(`bookings?select=property_id,gross_revenue,net_revenue,nights&property_id=in.(${ids})&status=eq.active&arrival_date=gte.${lyStart}&arrival_date=lte.${lyToday}`),
-  ]);
-  return { cur, ly, thisStart, lyStart };
+  const q = (from, to) => sbAll(`bookings?select=id,property_id,arrival_date,departure_date,nights,gross_revenue&property_id=in.(${ids})&status=eq.active&gross_revenue=gt.0&arrival_date=lt.${to}&departure_date=gt.${from}&order=arrival_date.asc,id.asc`);
+  const [cur, ly] = await Promise.all([q(thisStart, thisEnd), q(lyStart, lyEnd)]);
+  return { cur, ly, thisStart, thisEnd, lyStart, lyEnd, lyCut, todayStr };
+}
+
+// Gross by night inside [from, to) per property: { [propId]: { gross, nights } }
+function grossByNight(rows, from, to) {
+  const r = {};
+  for (const p of PROPERTIES) r[p.id] = { gross: 0, nights: 0 };
+  for (const b of rows) {
+    if (!r[b.property_id] || from >= to) continue;
+    const { revenue, nights } = prorateToMonth(b, from, to);
+    r[b.property_id].gross += revenue; r[b.property_id].nights += nights;
+  }
+  return r;
 }
 
 async function fetchBookingPaceData(paceMonths, todayStr) {
-  // LY snapshot: include all of (today − 365), not just midnight
-  const lySnapshot   = addDays(todayStr, -365) + 'T23:59:59';
+  // LY snapshot: end of the same date last year, Arizona time
+  const lySnapshot   = azEndOfDay(addDays(todayStr, -365));
   const firstTYStart = paceMonths[0].start;
   const lastTYEnd    = paceMonths[paceMonths.length - 1].end;
   const firstLYStart = paceMonths[0].lyStart;
   const lastLYEnd    = paceMonths[paceMonths.length - 1].lyEnd;
   const ids          = propIdList();
-  const [tyBookings, lyBookings] = await Promise.all([
+  const [tyBookings, lyRows] = await Promise.all([
     sb(`bookings?select=property_id,arrival_date,departure_date,nights,gross_revenue&property_id=in.(${ids})&status=eq.active&arrival_date=lt.${lastTYEnd}&departure_date=gt.${firstTYStart}&order=arrival_date.asc`),
-    sb(`bookings?select=property_id,arrival_date,departure_date,nights,gross_revenue&property_id=in.(${ids})&status=eq.active&booked_at=lte.${lySnapshot}&arrival_date=lt.${lastLYEnd}&departure_date=gt.${firstLYStart}&order=arrival_date.asc`),
+    sbAll(`bookings?select=${CANCEL_SELECT}&property_id=in.(${ids})&status=in.(active,canceled)&booked_at=lte.${lySnapshot}&arrival_date=lt.${lastLYEnd}&departure_date=gt.${firstLYStart}&order=arrival_date.asc,id.asc`),
   ]);
-  return { tyBookings, lyBookings };
+  // LY as it stood on the snapshot date, including stays cancelled later
+  const lyBookings = lyRows.filter(b => onBooksAt(b, lySnapshot)).map(asItStood);
+  return {
+    tyBookings, lyBookings,
+    lyNightsApprox: lySnapshot.slice(0, 10) <= CANCELED_AT_TRUSTED_AFTER,
+    lyAmountsMissing: lyBookings.filter(b => b.amountMissing).length,
+  };
+}
+
+// Pickup: bookings made in the last 7 and 15 days that are on the books today,
+// vs bookings made in the same windows last year that were on the books then
+async function fetchPickupData() {
+  const now = Date.now(), DAY = 86400000;
+  const lyNow = now - 365 * DAY;
+  const ids = propIdList();
+  const [ty, lyRows] = await Promise.all([
+    sb(`bookings?select=property_id,gross_revenue,booked_at&property_id=in.(${ids})&status=eq.active&booked_at=gte.${isoAt(now - 15 * DAY)}`),
+    sb(`bookings?select=${CANCEL_SELECT}&property_id=in.(${ids})&status=in.(active,canceled)&booked_at=gte.${isoAt(lyNow - 15 * DAY)}&booked_at=lte.${isoAt(lyNow)}`),
+  ]);
+  const ly = lyRows.filter(b => onBooksAt(b, isoAt(lyNow))).map(asItStood);
+  return { ty, ly, tyFrom7: isoAt(now - 7 * DAY), lyFrom7: isoAt(lyNow - 7 * DAY), lyAmountsMissing: ly.filter(b => b.amountMissing).length };
 }
 
 async function fetchRevenueForecastData(paceMonths, todayStr) {
-  const firstStart       = paceMonths[0].start;
-  const lastEnd          = paceMonths[paceMonths.length - 1].end;
-  const currentYearStart = `${todayStr.slice(0, 4)}-01-01`;
+  const firstStart = paceMonths[0].start;
+  const lastEnd    = paceMonths[paceMonths.length - 1].end;
+  const ids        = propIdList();
 
-  const ids              = propIdList();
-
-  // Fetch in parallel: current-year blocks for forecast months + all historical active/blocked
-  // (history paged until complete — no row cap)
+  // Current-year blocks for forecast months + all history through today, so
+  // next-year months have last year's month (e.g. January 2026 for January 2027).
+  // History paged until complete — no row cap.
   const [tyBlocked, histActive, histBlocked] = await Promise.all([
     sbAll(`bookings?select=property_id,arrival_date,departure_date&property_id=in.(${ids})&status=eq.blocked&arrival_date=lt.${lastEnd}&departure_date=gt.${firstStart}&order=arrival_date.asc,id.asc`),
-    sbAll(`bookings?select=property_id,arrival_date,departure_date,gross_revenue,booked_at&property_id=in.(${ids})&status=eq.active&arrival_date=lt.${currentYearStart}&order=arrival_date.asc,id.asc`),
-    sbAll(`bookings?select=property_id,arrival_date,departure_date&property_id=in.(${ids})&status=eq.blocked&arrival_date=lt.${currentYearStart}&order=arrival_date.asc,id.asc`),
+    sbAll(`bookings?select=property_id,arrival_date,departure_date,nights,gross_revenue,booked_at&property_id=in.(${ids})&status=eq.active&arrival_date=lt.${todayStr}&order=arrival_date.asc,id.asc`),
+    sbAll(`bookings?select=property_id,arrival_date,departure_date&property_id=in.(${ids})&status=eq.blocked&arrival_date=lt.${todayStr}&order=arrival_date.asc,id.asc`),
   ]);
 
   return { tyBlocked, histActive, histBlocked };
+}
+
+// Each property's first stay (for the first-full-month rule)
+async function fetchFirstArrivals() {
+  const rows = await Promise.all(PROPERTIES.map(p =>
+    sb(`bookings?select=arrival_date&property_id=eq.${p.id}&status=eq.active&order=arrival_date.asc&limit=1`)
+      .then(r => [p.id, r[0]?.arrival_date ?? null])));
+  return Object.fromEntries(rows);
 }
 
 // ─── Tax Profiles ─────────────────────────────────────────────────────────────
@@ -501,11 +594,15 @@ function computeEventADR(event, histActive, propId) {
   const earliest = Math.min(...propBookings.map(b => parseInt(b.arrival_date.slice(0, 4))));
   const byYear   = {};
 
-  for (let yr = earliest; yr < currentYear; yr++) {
+  // Every past year whose event window has fully happened (history runs through today,
+  // so a January 2027 event uses January 2026 too)
+  const eventYear = parseInt(event.start_date.slice(0, 4));
+  for (let yr = earliest; yr < Math.max(currentYear, eventYear); yr++) {
     // Build the event window for this historical year, accounting for cross-year events
     const evStart = `${yr}-${eventMonth}-${eventDay}`;
     const endYear = event.end_date.slice(5, 7) < event.start_date.slice(5, 7) ? yr + 1 : yr;
     const evEnd   = addDays(`${endYear}-${eventMonthE}-${eventDayE}`, 1); // exclusive end
+    if (evEnd > today()) continue;
 
     let revenue = 0;
     let nights  = 0;
@@ -660,6 +757,8 @@ async function fetchPricingAlertData() {
   let allSettings = [];
   try {
     allSettings = (await plGet('/listings'))?.listings || [];
+    const pickupFields = Object.keys(allSettings[0] || {}).filter(k => /pick|stly|book/i.test(k));
+    console.log(`  PriceLabs listing fields matching pickup/booking: ${pickupFields.join(', ') || 'none'}`);
   } catch (e) {
     recordFailure('PriceLabs settings', `${e.message}; pricing alerts can't be checked.`);
   }
@@ -752,6 +851,33 @@ function percentileSeriesIndex(series, category, propName) {
     return null;
   }
   return byPct;
+}
+
+// Market 7-day pickup from neighborhood_data "Market KPI": series labelled
+// "7 Day Pickup" and "7 Day Pickup STLY" (matched by label), by bedroom category
+// and month. Returns { month, pickup, stly } for the current month, or null.
+// Logs the labels, months and values so the unit can be confirmed.
+function parseMarketPickup(marketData, bedroomCount, propName, todayStr) {
+  const kpiKey = Object.keys(marketData?.data || {}).find(k => /market\s*kpi/i.test(k));
+  const kpi = kpiKey ? marketData.data[kpiKey] : null;
+  if (!kpi?.Category) {
+    console.log(`  Market pickup for ${propName}: no "Market KPI" in neighborhood data (sections: ${Object.keys(marketData?.data || {}).join(', ')})`);
+    return null;
+  }
+  const category = marketCategory(kpi, kpiKey, bedroomCount, propName);
+  if (!category) return null;
+  const yVals = category.Y_values || [];
+  const isLabelList = v => Array.isArray(v) && v.length === yVals.length && v.every(x => typeof x === 'string');
+  const labels = [category, kpi].flatMap(o => Object.values(o || {})).find(isLabelList) || [];
+  const iPick = labels.findIndex(l => /^\s*7\s*day\s*pickup\s*$/i.test(l));
+  const iStly = labels.findIndex(l => /^\s*7\s*day\s*pickup\s*stly\s*$/i.test(l));
+  const months = category.X_values || [];
+  const first = v => (Array.isArray(v) ? first(v[0]) : v); // some series are nested
+  const valueAt = (si, mi) => (si < 0 ? null : first((yVals[si] || [])[mi]) ?? null);
+  const mi = months.findIndex(x => String(x).slice(0, 7) === todayStr.slice(0, 7));
+  console.log(`  Market pickup for ${propName}: labels ${JSON.stringify(labels)} · months ${JSON.stringify(months)} · 7 Day Pickup ${JSON.stringify((yVals[iPick] || []).map(first))} · STLY ${JSON.stringify((yVals[iStly] || []).map(first))}`);
+  if (iPick < 0 || mi < 0) return null;
+  return { month: months[mi], pickup: valueAt(iPick, mi), stly: valueAt(iStly, mi) };
 }
 
 // Build date → { p25, p50, p75, p90 } lookup from neighborhood_data for a given bedroom count.
@@ -1113,19 +1239,6 @@ function gapOfferTable(gap, taxRate, plPrice) {
   <div style="font-size:11px;color:#888;margin-top:4px;">PriceLabs price for this night: ${plPrice > 0 ? fmt$(plPrice) : '—'} (reference only)</div>`;
 }
 
-function revenueByProp(rows) {
-  const r = {};
-  for (const p of PROPERTIES) r[p.id] = { gross: 0, net: 0, nights: 0, count: 0 };
-  for (const row of rows) {
-    if (!r[row.property_id]) continue;
-    r[row.property_id].gross  += Number(row.gross_revenue) || 0;
-    r[row.property_id].net    += Number(row.net_revenue) || 0;
-    r[row.property_id].nights += Number(row.nights) || 0;
-    r[row.property_id].count++;
-  }
-  return r;
-}
-
 // ─── Revenue Forecast ────────────────────────────────────────────────────────
 
 function computeLYActual(prop, paceMonth, histActive) {
@@ -1137,11 +1250,59 @@ function computeLYActual(prop, paceMonth, histActive) {
   return revenue;
 }
 
+// Booked gross ÷ PriceLabs price, per property, over booked nights in the next 90
+// days (today's PriceLabs prices cover booked nights too). Gross carries cleaning,
+// taxes and channel markup, so open nights × PriceLabs price × this ratio is on the
+// same basis as confirmed gross and last year's gross. Needs FORECAST_RATIO_MIN_NIGHTS
+// priced booked nights and a ratio within FORECAST_RATIO_RANGE; otherwise the
+// portfolio ratio (from properties that pass both) is used.
+const FORECAST_RATIO_MIN_NIGHTS = 7;
+const FORECAST_RATIO_RANGE = [0.8, 2.0];
+function bookedPriceRatios(bookings, plData, todayStr) {
+  const t90 = addDays(todayStr, 90);
+  const sums = {};
+  let allGross = 0, allPrice = 0;
+  for (const p of PROPERTIES) {
+    const prices = plData?.[p.plId];
+    sums[p.id] = { gross: 0, price: 0, nights: 0 };
+    if (!prices) continue;
+    for (const b of bookings) {
+      if (b.property_id !== p.id || b.status !== 'active' || !(Number(b.gross_revenue) > 0)) continue;
+      const perNight = Number(b.gross_revenue) / (b.nights || Math.max(1, diffDays(b.arrival_date, b.departure_date)));
+      let d = b.arrival_date < todayStr ? todayStr : b.arrival_date;
+      while (d < b.departure_date && d < t90) {
+        if (prices[d]?.price > 0) { sums[p.id].gross += perNight; sums[p.id].price += prices[d].price; sums[p.id].nights++; }
+        d = addDays(d, 1);
+      }
+    }
+  }
+  const own = p => (sums[p.id].price > 0 ? sums[p.id].gross / sums[p.id].price : null);
+  const inRange = r => r != null && r >= FORECAST_RATIO_RANGE[0] && r <= FORECAST_RATIO_RANGE[1];
+  for (const p of PROPERTIES) {
+    if (sums[p.id].nights >= FORECAST_RATIO_MIN_NIGHTS && inRange(own(p))) { allGross += sums[p.id].gross; allPrice += sums[p.id].price; }
+  }
+  const portfolio = allPrice > 0 ? allGross / allPrice : null;
+  const out = {};
+  for (const p of PROPERTIES) {
+    const s = sums[p.id], r = own(p);
+    out[p.id] = s.nights < FORECAST_RATIO_MIN_NIGHTS ? { ratio: portfolio, own: r, nights: s.nights, source: 'few_nights' }
+      : !inRange(r) ? { ratio: portfolio, own: r, nights: s.nights, source: 'out_of_range' }
+      : { ratio: r, own: r, nights: s.nights, source: 'own' };
+  }
+  return out;
+}
+
+// Same calendar date `years` earlier (Feb 29 → Feb 28)
+function shiftYears(dateStr, years) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const last = new Date(Date.UTC(y - years, m, 0)).getUTCDate();
+  return `${y - years}-${String(m).padStart(2, '0')}-${String(Math.min(d, last)).padStart(2, '0')}`;
+}
+
 // Core fill-rate + projection engine for one property × one forecast month.
-function computePropertyForecast(prop, paceMonth, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData) {
-  const currentYear = parseInt(todayStr.slice(0, 4));
+function computePropertyForecast(prop, paceMonth, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData, ratioInfo) {
+  const monthYear   = parseInt(paceMonth.start.slice(0, 4));
   const monthNum    = parseInt(paceMonth.start.split('-')[1]);
-  const todayDay    = parseInt(todayStr.split('-')[2]);
   const daysInMonth = diffDays(paceMonth.start, paceMonth.end);
 
   // Build date sets for confirmed bookings and blocks within this month
@@ -1184,20 +1345,22 @@ function computePropertyForecast(prop, paceMonth, todayStr, tyBookings, tyBlocke
 
   const earliestYear = propHistActive.length > 0
     ? Math.min(...propHistActive.map(b => parseInt(b.arrival_date.slice(0, 4))))
-    : currentYear - 1;
+    : monthYear - 1;
 
   const fillRates        = [];
   const fullyBookedYears = [];
   const lyMonthStr       = String(monthNum).padStart(2, '0');
 
-  for (let yr = currentYear - 1; yr >= earliestYear; yr--) {
+  // Every earlier year of this month, counted from the forecast month's own year
+  // (January 2027 starts at January 2026)
+  for (let yr = monthYear - 1; yr >= earliestYear; yr--) {
     const lyStart = `${yr}-${lyMonthStr}-01`;
     const lyEnd   = new Date(Date.UTC(yr, monthNum, 1)).toISOString().slice(0, 10);
     const lyDays  = diffDays(lyStart, lyEnd);
+    if (lyStart < (prop.firstFullMonth || '')) continue; // before the first full month
 
-    // Clamp same-day to handle shorter months (e.g., forecasting Mar when today is Jan 31)
-    const sameDay   = Math.min(todayDay, lyDays);
-    const samePoint = `${yr}-${lyMonthStr}-${String(sameDay).padStart(2, '0')}`;
+    // Same calendar point: today, shifted back as many years as this month is
+    const samePoint = shiftYears(todayStr, monthYear - yr);
 
     // Historical blocked dates in this month
     const lyBlockedDates = new Set();
@@ -1238,8 +1401,9 @@ function computePropertyForecast(prop, paceMonth, todayStr, tyBookings, tyBlocke
     fillRates.push({ yr, fillRate, openAtPoint: lyOpenAtPoint, filled: lyFilled });
   }
 
-  // LY actual revenue (no booked_at filter — final month-end result)
-  const lyActualRevenue = computeLYActual(prop, paceMonth, histActive);
+  // LY actual revenue (no booked_at filter — final month-end result); null before
+  // the property's first full month
+  const lyActualRevenue = hasPriorYear(prop, paceMonth.lyStart) ? computeLYActual(prop, paceMonth, histActive) : null;
 
   if (fillRates.length === 0 && openNights > 0) {
     return {
@@ -1254,12 +1418,13 @@ function computePropertyForecast(prop, paceMonth, todayStr, tyBookings, tyBlocke
     ? fillRates.reduce((s, r) => s + r.fillRate, 0) / fillRates.length
     : 0;
 
-  // Average PriceLabs price across remaining open nights that have price data
+  // Open nights valued at the average PriceLabs price × the property's booked-gross ratio
   const propPrices      = plData?.[prop.plId] || {};
   const pricedOpenDates = openDates.filter(d => propPrices[d]?.price > 0);
-  const avgPrice        = pricedOpenDates.length > 0
+  const avgPLPrice      = pricedOpenDates.length > 0
     ? pricedOpenDates.reduce((s, d) => s + propPrices[d].price, 0) / pricedOpenDates.length
     : null;
+  const avgPrice = avgPLPrice != null && ratioInfo?.ratio ? avgPLPrice * ratioInfo.ratio : null;
 
   const scenario = (mult) => {
     if (openNights === 0) return confirmedRevenue; // Fully booked — confirmed is the projection
@@ -1271,7 +1436,7 @@ function computePropertyForecast(prop, paceMonth, todayStr, tyBookings, tyBlocke
   const base          = scenario(1.0);
   const optimistic    = scenario(1.3);
   const isFullyBooked = openNights === 0;
-  const isRedFlag     = base != null && lyActualRevenue > 0 && base < lyActualRevenue * 0.85;
+  const isRedFlag     = base != null && lyActualRevenue != null && lyActualRevenue > 0 && base < lyActualRevenue * 0.85;
 
   return {
     prop, paceMonth, confirmedRevenue, confirmedNights, openNights, availableDays,
@@ -1326,52 +1491,146 @@ const DEMAND_COLOR = {
 
 // ─── Email Sections ───────────────────────────────────────────────────────────
 
+// MTD by night, gross (dashboard rule). Earned = nights before today; rest of
+// month = nights from today on. Last year: the same nights of last year's month,
+// and its full month. Before a property's first full month: "No prior year".
+function mtdFigures(mtd) {
+  const earned = grossByNight(mtd.cur, mtd.thisStart, mtd.todayStr);
+  const rest   = grossByNight(mtd.cur, mtd.todayStr, mtd.thisEnd);
+  const lySame = grossByNight(mtd.ly, mtd.lyStart, mtd.lyCut);
+  const lyFull = grossByNight(mtd.ly, mtd.lyStart, mtd.lyEnd);
+  const out = {};
+  for (const p of PROPERTIES) {
+    const prior = hasPriorYear(p, mtd.lyStart);
+    out[p.id] = { earned: earned[p.id], rest: rest[p.id], lySame: prior ? lySame[p.id] : null, lyFull: prior ? lyFull[p.id] : null };
+  }
+  return out;
+}
+
 function sectionMTD(mtd, todayStr) {
-  const cur = revenueByProp(mtd.cur);
-  const ly  = revenueByProp(mtd.ly);
+  const fig = mtdFigures(mtd);
   const monthLabel = new Date(mtd.thisStart + 'T00:00:00Z')
     .toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+  const yoyCell = (cur, ly, bold) => {
+    const yoy = ly ? (cur - ly) / ly * 100 : null;
+    const color = yoy == null ? '#999' : yoy >= 0 ? '#1a7f5a' : '#c0392b';
+    return `<td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;text-align:right;${bold ? 'font-weight:700;' : 'font-weight:600;'}color:${color};">${yoy == null ? '—' : `${yoy >= 0 ? '+' : ''}${Math.round(yoy)}%`}</td>`;
+  };
+  const NO_PY = '<span style="font-size:11px;color:#aaa;">No prior year</span>';
+  const TDR = 'padding:8px 12px;border-bottom:1px solid #f0f0f0;text-align:right;';
 
-  let rows = '', totalCur = 0, totalLY = 0;
+  let rows = '';
+  const tot = { earned: 0, rest: 0, cmpEarned: 0, lySame: 0, lyFull: 0 };
+  const noPrior = [];
   PROPERTIES.forEach((p, i) => {
-    const c = cur[p.id], l = ly[p.id];
-    totalCur += c.gross; totalLY += l.gross;
-    const yoy = l.gross ? ((c.gross - l.gross) / l.gross) * 100 : null;
-    const yoyStr = yoy != null ? `${yoy >= 0 ? '+' : ''}${Math.round(yoy)}%` : '—';
-    const yoyColor = yoy == null ? '#999' : yoy >= 0 ? '#1a7f5a' : '#c0392b';
-    rows += groupRow(p, i, 5) + `<tr>
+    const f = fig[p.id];
+    tot.earned += f.earned.gross; tot.rest += f.rest.gross;
+    if (f.lySame) { tot.cmpEarned += f.earned.gross; tot.lySame += f.lySame.gross; tot.lyFull += f.lyFull.gross; }
+    else noPrior.push(p.name);
+    rows += groupRow(p, i, 6) + `<tr>
       <td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;">${tag(p)}</td>
-      <td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;text-align:right;font-weight:600;">${fmt$(c.gross)}</td>
-      <td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;text-align:right;color:#666;">${fmt$(l.gross)}</td>
-      <td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;text-align:right;font-weight:600;color:${yoyColor};">${yoyStr}</td>
-      <td style="padding:8px 12px;border-bottom:1px solid #f0f0f0;text-align:right;color:#888;font-size:12px;">${c.count} bkg · ${c.nights} nts</td>
+      <td style="${TDR}font-weight:600;">${fmt$(f.earned.gross)}<div style="font-size:10px;color:#aaa;font-weight:400;">${f.earned.nights} nts</div></td>
+      <td style="${TDR}color:#666;">${f.lySame ? fmt$(f.lySame.gross) : NO_PY}</td>
+      ${f.lySame ? yoyCell(f.earned.gross, f.lySame.gross) : `<td style="${TDR}color:#999;">—</td>`}
+      <td style="${TDR}">${fmt$(f.rest.gross)}<div style="font-size:10px;color:#aaa;">${f.rest.nights} nts</div></td>
+      <td style="${TDR}color:#666;">${f.lyFull ? fmt$(f.lyFull.gross) : NO_PY}</td>
     </tr>`;
   });
-  const totYoY = totalLY ? ((totalCur - totalLY) / totalLY * 100) : null;
-  const totYoYStr = totYoY != null ? `${totYoY >= 0 ? '+' : ''}${Math.round(totYoY)}%` : '—';
-  const totColor = totYoY == null ? '#999' : totYoY >= 0 ? '#1a7f5a' : '#c0392b';
+  const excl = noPrior.length ? `<div style="font-size:10px;color:#aaa;font-weight:400;">excl. ${noPrior.join(', ')}</div>` : '';
   rows += `<tr style="background:#f8f9fa;">
     <td style="padding:8px 12px;font-weight:700;">Portfolio Total</td>
-    <td style="padding:8px 12px;text-align:right;font-weight:700;">${fmt$(totalCur)}</td>
-    <td style="padding:8px 12px;text-align:right;color:#666;">${fmt$(totalLY)}</td>
-    <td style="padding:8px 12px;text-align:right;font-weight:700;color:${totColor};">${totYoYStr}</td>
-    <td style="padding:8px 12px;"></td>
+    <td style="padding:8px 12px;text-align:right;font-weight:700;">${fmt$(tot.earned)}</td>
+    <td style="padding:8px 12px;text-align:right;color:#666;">${fmt$(tot.lySame)}${excl}</td>
+    ${yoyCell(tot.cmpEarned, tot.lySame, true)}
+    <td style="padding:8px 12px;text-align:right;font-weight:700;">${fmt$(tot.rest)}</td>
+    <td style="padding:8px 12px;text-align:right;color:#666;">${fmt$(tot.lyFull)}${excl}</td>
   </tr>`;
 
+  const throughLabel = todayStr > mtd.thisStart ? `${fmtDate(mtd.thisStart)}–${fmtDate(addDays(todayStr, -1))}` : 'none yet';
   return `<h2 id="section-mtd" style="${H2}">📊 Month-to-Date Revenue — ${monthLabel}</h2>
   <table style="width:100%;border-collapse:collapse;font-size:13px;">
     <tr style="background:#f8f9fa;">
-      <th style="${TH}">Property</th><th style="${TH}text-align:right;">This Month</th>
-      <th style="${TH}text-align:right;">Same Pd LY</th><th style="${TH}text-align:right;">YoY</th>
-      <th style="${TH}text-align:right;">Volume</th>
+      <th style="${TH}">Property</th>
+      <th style="${TH}text-align:right;">Earned<br><span style="font-weight:400;font-size:10px;">${throughLabel}</span></th>
+      <th style="${TH}text-align:right;">Same Nights LY</th><th style="${TH}text-align:right;">YoY</th>
+      <th style="${TH}text-align:right;">Booked Rest<br><span style="font-weight:400;font-size:10px;">of month</span></th>
+      <th style="${TH}text-align:right;">LY Full Month</th>
     </tr>${rows}
   </table>
-  <p style="font-size:11px;color:#aaa;margin:8px 0 0;">Bookings with arrival date in ${monthLabel} through ${fmtDate(todayStr)}. Prior year = same ${Math.round(diffDays(mtd.lyStart, addDays(todayStr,-365))+1)}-day window.</p>`;
+  <p style="font-size:11px;color:#aaa;margin:8px 0 0;">Gross by night, same as the portal dashboard: each night of a stay counts the stay's gross ÷ nights; $0 bookings are excluded. Earned = nights before today; Booked Rest = nights from today to month-end already on the books. Last year compares the same nights of ${new Date(mtd.lyStart + 'T00:00:00Z').toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })}.${noPrior.length ? ` Portfolio YoY excludes properties with no prior year.` : ''}</p>`;
 }
 
-function sectionBookingPace(tyBookings, lyBookings, paceMonths, todayStr) {
+// Pickup: bookings made in the last 7 / 15 days (count + gross) vs the same windows
+// last year. Zero pickup for 14+ days is flagged.
+function pickupTable(pickup, lastBookedMap, marketPickup) {
+  const win = (rows, from7) => {
+    const r = {};
+    for (const p of PROPERTIES) r[p.id] = { n7: 0, g7: 0, n15: 0, g15: 0 };
+    for (const b of rows) {
+      const x = r[b.property_id]; if (!x) continue;
+      const g = Number(b.gross_revenue) || 0;
+      x.n15++; x.g15 += g;
+      if (Date.parse(b.booked_at) >= Date.parse(from7)) { x.n7++; x.g7 += g; }
+    }
+    return r;
+  };
+  const ty = win(pickup.ty, pickup.tyFrom7), ly = win(pickup.ly, pickup.lyFrom7);
+  const lyWindowStart = isoAt(Date.parse(pickup.lyFrom7) - 8 * 86400000).slice(0, 10);
+  const cell = (n, g) => `${n} · ${fmt$(g)}`;
+  const TDR = 'padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;';
+  const NO_PY = '<span style="font-size:11px;color:#aaa;">No prior year</span>';
+  const tot = { ty: { n7: 0, g7: 0, n15: 0, g15: 0 }, ly: { n7: 0, g7: 0, n15: 0, g15: 0 } };
+  let rows = '';
+  PROPERTIES.forEach((p, i) => {
+    const t = ty[p.id], l = ly[p.id];
+    const prior = hasPriorYear(p, lyWindowStart);
+    for (const k of Object.keys(t)) { tot.ty[k] += t[k]; if (prior) tot.ly[k] += l[k]; }
+    const last = lastBookedMap?.[p.id];
+    const quietDays = last ? Math.floor((Date.now() - Date.parse(last)) / 86400000) : null;
+    const flag = quietDays != null && quietDays >= 14
+      ? `<div style="font-size:10px;color:#c0392b;font-weight:600;">No new bookings in ${quietDays} days</div>` : '';
+    const mk = marketPickup?.[p.id];
+    const mkCell = mk?.pickup != null
+      ? `${Math.round(mk.pickup * 10) / 10}${mk.stly != null ? `<div style="font-size:10px;color:#aaa;">STLY ${Math.round(mk.stly * 10) / 10}</div>` : ''}`
+      : '<span style="font-size:11px;color:#aaa;">—</span>';
+    rows += groupRow(p, i, 6) + `<tr>
+      <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;">${tag(p)}${flag}</td>
+      <td style="${TDR}font-weight:600;">${cell(t.n7, t.g7)}</td>
+      <td style="${TDR}color:#666;">${prior ? cell(l.n7, l.g7) : NO_PY}</td>
+      <td style="${TDR}font-weight:600;">${cell(t.n15, t.g15)}</td>
+      <td style="${TDR}color:#666;">${prior ? cell(l.n15, l.g15) : NO_PY}</td>
+      <td style="${TDR}">${mkCell}</td>
+    </tr>`;
+  });
+  rows += `<tr style="background:#f8f9fa;">
+    <td style="padding:7px 12px;font-weight:700;">Portfolio Total</td>
+    <td style="padding:7px 12px;text-align:right;font-weight:700;">${cell(tot.ty.n7, tot.ty.g7)}</td>
+    <td style="padding:7px 12px;text-align:right;color:#666;">${cell(tot.ly.n7, tot.ly.g7)}</td>
+    <td style="padding:7px 12px;text-align:right;font-weight:700;">${cell(tot.ty.n15, tot.ty.g15)}</td>
+    <td style="padding:7px 12px;text-align:right;color:#666;">${cell(tot.ly.n15, tot.ly.g15)}</td>
+    <td style="padding:7px 12px;"></td>
+  </tr>`;
+  const missing = pickup.lyAmountsMissing
+    ? ` ${pickup.lyAmountsMissing} last-year booking${pickup.lyAmountsMissing !== 1 ? 's were' : ' was'} cancelled later with no recorded amount; counted, but at $0.` : '';
+  return `<div style="margin-bottom:20px;">
+    <div style="font-size:13px;font-weight:700;color:#444;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid #eee;">Pickup — new bookings</div>
+    <table style="width:100%;border-collapse:collapse;font-size:13px;">
+      <tr style="background:#f8f9fa;">
+        <th style="${TH}">Property</th>
+        <th style="${TH}text-align:right;">Last 7 Days</th><th style="${TH}text-align:right;">Same 7 LY</th>
+        <th style="${TH}text-align:right;">Last 15 Days</th><th style="${TH}text-align:right;">Same 15 LY</th>
+        <th style="${TH}text-align:right;">Market 7-Day<br><span style="font-weight:400;font-size:10px;">PriceLabs, this month</span></th>
+      </tr>${rows}
+    </table>
+    <p style="font-size:11px;color:#aaa;margin:6px 0 0;">Bookings made in the window and still on the books (count · full-stay gross). Last year counts bookings made in the same windows that were on the books then, including ones cancelled later. Market 7-Day = PriceLabs "7 Day Pickup" for the property's bedroom category this month, with the same time last year (STLY).${missing}</p>
+  </div>`;
+}
+
+function sectionBookingPace(paceData, paceMonths, todayStr, pickup, lastBookedMap, marketPickup) {
+  const { tyBookings, lyBookings } = paceData;
   const lySnapshotLabel = fmtDate(addDays(todayStr, -365));
   let html = `<h2 id="section-pace" style="${H2}">📈 Booking Pace vs Last Year</h2>`;
+  html += pickup ? pickupTable(pickup, lastBookedMap, marketPickup) : '';
 
   // Build dynamic context notes — auto-update as conditions change
   const contextNotes = [];
@@ -1398,7 +1657,14 @@ function sectionBookingPace(tyBookings, lyBookings, paceMonths, todayStr) {
     ? ` ${contextNotes.join('. ')}.`
     : '';
 
-  html += `<p style="font-size:12px;color:#888;margin:0 0 16px;">Advance booking snapshot: revenue on books today vs. the same snapshot from ${lySnapshotLabel} last year — not LY final actuals.${contextStr}</p>`;
+  const accuracy = [];
+  if (paceData.lyNightsApprox)
+    accuracy.push(`Last year's nights are approximate: cancellations recorded on or before ${fmtDate(CANCELED_AT_TRUSTED_AFTER)}, ${CANCELED_AT_TRUSTED_AFTER.slice(0, 4)} have no real cancel date, so stays cancelled after ${lySnapshotLabel} last year can be missing`);
+  if (paceData.lyAmountsMissing)
+    accuracy.push(`${paceData.lyAmountsMissing} last-year booking${paceData.lyAmountsMissing !== 1 ? 's were' : ' was'} on the books then but cancelled later with no recorded amount; the nights count but the revenue shows as $0, so last year's revenue is understated`);
+  const accuracyStr = accuracy.length ? ` ${accuracy.join('. ')}.` : '';
+
+  html += `<p style="font-size:12px;color:#888;margin:0 0 16px;">On the books today vs. on the books on ${lySnapshotLabel} last year, including stays cancelled after that date — not LY final actuals.${contextStr}${accuracyStr}</p>`;
 
   for (const month of paceMonths) {
     const ty = {}, ly = {};
@@ -1420,29 +1686,32 @@ function sectionBookingPace(tyBookings, lyBookings, paceMonths, todayStr) {
     }
 
     let rows = '';
-    let totTYRev = 0, totLYRev = 0, totTYNts = 0, totLYNts = 0;
+    let totTYRev = 0, totLYRev = 0, totTYNts = 0, totLYNts = 0, cmpTYRev = 0;
+    const noPrior = [];
     PROPERTIES.forEach((p, i) => {
-      const tyRev = ty[p.id].revenue, lyRev = ly[p.id].revenue;
-      const tyNts = ty[p.id].nights,  lyNts = ly[p.id].nights;
-      totTYRev += tyRev; totLYRev += lyRev; totTYNts += tyNts; totLYNts += lyNts;
+      const prior = hasPriorYear(p, month.lyStart);
+      const tyRev = ty[p.id].revenue, lyRev = prior ? ly[p.id].revenue : null;
+      const tyNts = ty[p.id].nights,  lyNts = prior ? ly[p.id].nights : null;
+      totTYRev += tyRev; totTYNts += tyNts;
+      if (prior) { totLYRev += lyRev; totLYNts += lyNts; cmpTYRev += tyRev; } else noPrior.push(p.name);
       const yoy      = lyRev > 0 ? (tyRev - lyRev) / lyRev * 100 : null;
       const yoyStr   = yoy != null ? `${yoy >= 0 ? '+' : ''}${Math.round(yoy)}%` : '—';
       const yoyColor = yoy == null ? '#999' : yoy >= 5 ? '#1a7f5a' : yoy < -5 ? '#c0392b' : '#e67e22';
       rows += groupRow(p, i, 5) + `<tr>
         <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;">${tag(p)}</td>
         <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;font-weight:600;">${fmt$(Math.round(tyRev))}</td>
-        <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;color:#666;">${fmt$(Math.round(lyRev))}</td>
+        <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;color:#666;">${prior ? fmt$(Math.round(lyRev)) : '<span style="font-size:11px;color:#aaa;">No prior year</span>'}</td>
         <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;font-weight:600;color:${yoyColor};">${yoyStr}</td>
-        <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;color:#888;font-size:12px;">${Math.round(tyNts)}n / ${Math.round(lyNts)}n</td>
+        <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;color:#888;font-size:12px;">${Math.round(tyNts)}n / ${prior ? Math.round(lyNts) + 'n' : '—'}</td>
       </tr>`;
     });
-    const totYoY    = totLYRev > 0 ? (totTYRev - totLYRev) / totLYRev * 100 : null;
+    const totYoY    = totLYRev > 0 ? (cmpTYRev - totLYRev) / totLYRev * 100 : null;
     const totYoYStr = totYoY != null ? `${totYoY >= 0 ? '+' : ''}${Math.round(totYoY)}%` : '—';
     const totColor  = totYoY == null ? '#999' : totYoY >= 5 ? '#1a7f5a' : totYoY < -5 ? '#c0392b' : '#e67e22';
     rows += `<tr style="background:#f8f9fa;">
       <td style="padding:7px 12px;font-weight:700;">Portfolio Total</td>
       <td style="padding:7px 12px;text-align:right;font-weight:700;">${fmt$(Math.round(totTYRev))}</td>
-      <td style="padding:7px 12px;text-align:right;color:#666;">${fmt$(Math.round(totLYRev))}</td>
+      <td style="padding:7px 12px;text-align:right;color:#666;">${fmt$(Math.round(totLYRev))}${noPrior.length ? `<div style="font-size:10px;color:#aaa;">excl. ${noPrior.join(', ')}</div>` : ''}</td>
       <td style="padding:7px 12px;text-align:right;font-weight:700;color:${totColor};">${totYoYStr}</td>
       <td style="padding:7px 12px;text-align:right;color:#888;font-size:12px;">${Math.round(totTYNts)}n / ${Math.round(totLYNts)}n</td>
     </tr>`;
@@ -1467,23 +1736,37 @@ function sectionBookingPace(tyBookings, lyBookings, paceMonths, todayStr) {
   return html;
 }
 
-function sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData) {
+// "Emerald Views 1.32 (18 nts) · …" for the forecast footnote
+function ratioNote(ratios) {
+  if (!ratios) return 'not available';
+  return PROPERTIES.map(p => {
+    const r = ratios[p.id];
+    if (!r?.ratio) return `${p.name} —`;
+    if (r.source === 'few_nights') return `${p.name} ${r.ratio.toFixed(2)} (portfolio ratio; only ${r.nights} booked nights)`;
+    if (r.source === 'out_of_range') return `${p.name} ${r.ratio.toFixed(2)} (portfolio ratio; own ratio ${r.own.toFixed(2)} is outside ${FORECAST_RATIO_RANGE.join('–')})`;
+    return `${p.name} ${r.ratio.toFixed(2)} (${r.nights} nts)`;
+  }).join(' · ');
+}
+
+function sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData, ratios) {
   let html = `<h2 id="section-forecast" style="${H2}">🔮 Revenue Forecast</h2>`;
   html += `<p style="font-size:12px;color:#888;margin:0 0 16px;">Projected month-end revenue: confirmed bookings + expected fill of remaining open nights based on historical patterns.</p>`;
 
   for (const month of paceMonths) {
     const forecasts = PROPERTIES.map(prop =>
-      computePropertyForecast(prop, month, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData)
+      computePropertyForecast(prop, month, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData, ratios?.[prop.id])
     );
 
     let totConfirmed = 0, totConservative = 0, totBase = 0, totOptimistic = 0, totLY = 0;
     const excludedFromScenarios = [];
+    const noPriorYear = [];
 
     let rows = '';
     forecasts.forEach((f, i) => {
       rows += groupRow(f.prop, i, 8);
       totConfirmed += f.confirmedRevenue;
-      totLY        += f.lyActualRevenue;
+      if (f.lyActualRevenue == null) noPriorYear.push(f.prop.name);
+      else totLY += f.lyActualRevenue;
 
       const rowBg = f.isRedFlag ? '#fff5f5' : '#fff';
 
@@ -1542,7 +1825,7 @@ function sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, his
         ${openNtsCell}
         ${fillRateCell}
         ${scenarioCells}
-        <td style="padding:7px 10px;text-align:right;color:${lyColor};">${fmt$(Math.round(f.lyActualRevenue))}</td>
+        <td style="padding:7px 10px;text-align:right;color:${lyColor};">${f.lyActualRevenue == null ? '<span style="font-size:11px;color:#aaa;">No prior year</span>' : fmt$(Math.round(f.lyActualRevenue))}</td>
       </tr>`;
 
       // Footnote row for years where property was fully booked at this point
@@ -1574,7 +1857,7 @@ function sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, his
       <td style="padding:7px 12px;"></td>
       <td style="padding:7px 12px;"></td>
       ${totScenarioCells}
-      <td style="padding:7px 12px;text-align:right;font-weight:700;color:#666;">${fmt$(Math.round(totLY))}</td>
+      <td style="padding:7px 12px;text-align:right;font-weight:700;color:#666;">${fmt$(Math.round(totLY))}${noPriorYear.length ? `<div style="font-size:10px;color:#aaa;font-weight:400;">excl. ${noPriorYear.join(', ')}</div>` : ''}</td>
     </tr>`;
 
     html += `<div style="margin-bottom:20px;">
@@ -1598,7 +1881,9 @@ function sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, his
   }
 
   html += `<p style="font-size:11px;color:#aaa;margin:8px 0 0;">
-    Revenue prorated for bookings spanning month boundaries. Fill rate = % of open nights at this same calendar date historically that were booked by month-end, averaged across all available prior years.
+    All amounts are gross (cleaning and taxes included), prorated for bookings spanning month boundaries.
+    Open nights are valued at the PriceLabs price × each property's booked-gross ratio (booked gross ÷ PriceLabs price on its booked nights in the next 90 days): ${ratioNote(ratios)}.
+    Fill rate = % of open nights at this same calendar date historically that were booked by month-end, averaged across all available prior years.
     Scenarios: Conservative = 50% of fill rate · Base = 100% · Optimistic = 130%.
     <span style="display:inline-block;background:#fff5f5;color:#c0392b;padding:1px 5px;border-radius:3px;margin-top:2px;">Red row</span> = base projection &gt;15% below last year's actual.
   </p>`;
@@ -1857,6 +2142,16 @@ function sectionSmartEvents(hardcodedEvents, cachedEvents, plData, histActive, t
   return html;
 }
 
+// Cancelled amount = gross while the stay was active (the portal records it from
+// Nov 2026; earlier cancellations show "amount not recorded")
+const cancelledAmount = b => b.last_active_gross != null ? `${fmt$(Number(b.last_active_gross))} cancelled` : 'amount not recorded';
+function rebookedText(b, nights) {
+  if (!b.rebookedNights) return 'Not rebooked yet';
+  return b.rebookedNights >= nights
+    ? `Rebooked: all ${nights} night${nights !== 1 ? 's' : ''}, ${fmt$(b.rebookedGross)}`
+    : `Rebooked: ${b.rebookedNights} of ${nights} nights, ${fmt$(b.rebookedGross)}`;
+}
+
 function sectionActivity({ newBookings, cancellations }) {
   if (!newBookings.length && !cancellations.length) {
     return `<h2 id="section-activity" style="${H2}">🔔 Activity — Last 24 Hours</h2>
@@ -1883,7 +2178,8 @@ function sectionActivity({ newBookings, cancellations }) {
       html += `<div style="padding:6px 0;border-bottom:1px solid #f4f4f4;font-size:13px;">
         <strong>${b.guest_display_name || 'Guest'}</strong>
         <span style="color:#888;"> · ${p?.name ?? '?'} · ${fmtDate(b.arrival_date)}–${fmtDate(b.departure_date)} (${n}n) · ${channelLabel(b)} · </span>
-        <strong style="color:#c0392b;">${fmt$(b.gross_revenue)}</strong>
+        <strong style="color:#c0392b;">${cancelledAmount(b)}</strong>
+        <div style="font-size:12px;color:#888;margin-top:2px;">${rebookedText(b, n)}</div>
       </div>`;
     }
   }
@@ -2201,13 +2497,14 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
     // · 4 RED pricing · 5 YELLOW pricing · 6 no recent bookings · 7 pace · 8 underpriced events
     const actions = [];
 
-    // Cancellations for this property in last 24h
+    // Cancellations for this property in last 24h (fully rebooked ones stay in Activity only)
     for (const c of (activity.cancellations || [])) {
       if (c.property_id !== prop.id) continue;
       const nights = c.nights || Math.max(1, diffDays(c.arrival_date, c.departure_date));
+      if (c.rebookedNights >= nights) continue;
       actions.push({
         level: 'red', priority: 2, anchor: '#section-activity', sectionLabel: 'Activity',
-        text: `${c.guest_display_name || 'Guest'} cancelled ${fmtDate(c.arrival_date)}–${fmtDate(c.departure_date)} (${nights} night${nights !== 1 ? 's' : ''}, ${fmt$(c.gross_revenue)} lost). Dates are now open — re-list or contact your waitlist.`,
+        text: `${c.guest_display_name || 'Guest'} cancelled ${fmtDate(c.arrival_date)}–${fmtDate(c.departure_date)} (${nights} night${nights !== 1 ? 's' : ''}, ${cancelledAmount(c)}). ${rebookedText(c, nights)}.`,
       });
     }
 
@@ -2262,8 +2559,8 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
       });
     }
 
-    // No new bookings in >21 days with open nights
-    if (plData && daysSince != null && daysSince >= 21 && openNext30 > 0) {
+    // No new bookings in 14+ days with open nights
+    if (plData && daysSince != null && daysSince >= 14 && openNext30 > 0) {
       actions.push({
         level: 'watch', priority: 6, anchor: '#section-pricing', sectionLabel: 'Pricing',
         text: `No new bookings in ${daysSince} days with ${openNext30} open night${openNext30 !== 1 ? 's' : ''} available in the next 30 days. Check listing rank, photos, and reviews across all channels.`,
@@ -2282,12 +2579,12 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
       });
     }
 
-    // Booking pace >20% behind LY for first pace month
+    // Booking pace >20% behind LY for first pace month (LY measured against LY's month)
     const pm = paceMonths[0];
     let tyRev = 0, lyRev = 0;
     for (const b of tyBookings) { if (b.property_id === prop.id) tyRev += prorateToMonth(b, pm.start, pm.end).revenue; }
-    for (const b of lyBookings) { if (b.property_id === prop.id) lyRev += prorateToMonth(b, pm.start, pm.end).revenue; }
-    if (lyRev > 200 && tyRev < lyRev * 0.80) {
+    for (const b of lyBookings) { if (b.property_id === prop.id) lyRev += prorateToMonth(b, pm.lyStart, pm.lyEnd).revenue; }
+    if (hasPriorYear(prop, pm.lyStart) && lyRev > 200 && tyRev < lyRev * 0.80) {
       const pct = Math.round((1 - tyRev / lyRev) * 100);
       actions.push({
         level: 'watch', priority: 7, anchor: '#section-pace', sectionLabel: 'Booking Pace',
@@ -2301,13 +2598,17 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
     summaries.push({ prop, synopsis, actions, status: hasRed ? 'red' : hasWatch ? 'yellow' : 'green' });
   }
 
-  // ── Portfolio note (MTD) ──────────────────────────────────────────────────
-  const curRevTotal = (mtd?.cur ?? []).reduce((s, b) => s + (Number(b.gross_revenue) || 0), 0);
-  const lyRevTotal  = (mtd?.ly ?? []).reduce((s, b) => s + (Number(b.gross_revenue) || 0), 0);
+  // ── Portfolio note (MTD): earned nights vs the same nights last year,
+  // properties with a prior year only (same figures as the MTD table)
+  let curRevTotal = 0, lyRevTotal = 0;
+  if (mtd) {
+    const fig = mtdFigures(mtd);
+    for (const p of PROPERTIES) if (fig[p.id].lySame) { curRevTotal += fig[p.id].earned.gross; lyRevTotal += fig[p.id].lySame.gross; }
+  }
   let portfolioNote = null;
   if (lyRevTotal > 200 && curRevTotal < lyRevTotal * 0.85) {
     const pct = Math.round((1 - curRevTotal / lyRevTotal) * 100);
-    portfolioNote = `Portfolio MTD: ${fmt$(Math.round(curRevTotal))} vs ${fmt$(Math.round(lyRevTotal))} last year (${pct}% behind). See MTD Revenue section for property breakdown.`;
+    portfolioNote = `Portfolio MTD earned: ${fmt$(Math.round(curRevTotal))} vs ${fmt$(Math.round(lyRevTotal))} on the same nights last year (${pct}% behind). See MTD Revenue section for property breakdown.`;
   }
 
   return { summaries, portfolioNote };
@@ -2445,9 +2746,13 @@ async function main() {
   }
   console.log(`  Properties: ${PROPERTIES.map(p => `${p.name} (${groupLabel(p)})`).join(', ')}`);
 
+  // First full month per property: last-year comparisons start there
+  const firstArrivals = await step('First stays', fetchFirstArrivals);
+  for (const p of PROPERTIES) p.firstFullMonth = firstFullMonth(firstArrivals?.[p.id]);
+
   const paceMonths = getPaceMonths(todayStr);
   const cachedEvents = fetchEventsCache(todayStr);
-  const [activity, mtd, bookings, taxProfiles, paceData, forecastData, lastBookedMap] = await Promise.all([
+  const [activity, mtd, bookings, taxProfiles, paceData, forecastData, lastBookedMap, pickup] = await Promise.all([
     step('Recent activity', fetchRecentActivity),
     step('Month-to-date revenue', () => fetchMTDRevenue(todayStr)),
     step('Bookings (next 90 days)', () => fetchBookings90(todayStr, t90)),
@@ -2455,6 +2760,7 @@ async function main() {
     step('Booking pace', () => fetchBookingPaceData(paceMonths, todayStr)),
     step('Revenue forecast history', () => fetchRevenueForecastData(paceMonths, todayStr)),
     fetchLastBookedDates(),
+    step('Pickup', fetchPickupData),
   ]);
   // Open nights, gaps, prices and alerts all depend on the 90-day bookings
   if (!bookings) throw new Error('Bookings for the next 90 days could not be loaded.');
@@ -2462,7 +2768,8 @@ async function main() {
   const { tyBlocked, histActive, histBlocked } = forecastData ?? { tyBlocked: null, histActive: null, histBlocked: null };
 
   console.log(`  Bookings (90d): ${bookings.length} | New: ${activity?.newBookings.length ?? '—'} | Cancelled: ${activity?.cancellations.length ?? '—'} | MTD: ${mtd?.cur.length ?? '—'}`);
-  console.log(`  Pace months: ${paceMonths.map(m => m.label).join(', ')} | TY: ${tyBookings?.length ?? '—'} bkgs | LY: ${lyBookings?.length ?? '—'} bkgs`);
+  console.log(`  Pace months: ${paceMonths.map(m => m.label).join(', ')} | TY: ${tyBookings?.length ?? '—'} bkgs | LY: ${lyBookings?.length ?? '—'} bkgs as they stood (${paceData?.lyAmountsMissing ?? '—'} cancelled later, amount not recorded)`);
+  console.log(`  Pickup (15d): TY ${pickup?.ty.length ?? '—'} | LY ${pickup?.ly.length ?? '—'} · first full months: ${PROPERTIES.map(p => `${p.name} ${p.firstFullMonth ?? '—'}`).join(', ')}`);
   console.log(`  Forecast: ${histActive?.length ?? '—'} historical bookings | ${tyBlocked?.length ?? '—'} current-yr blocks`);
 
   // PriceLabs: file fallback (local only), then REST API, then preview sample
@@ -2497,6 +2804,17 @@ async function main() {
   const hardcodedEvents = getHardcodedEvents(todayStr);
   console.log(`  Events: ${hardcodedEvents.length} hardcoded + ${cachedEvents.length} from cache`);
 
+  // Market 7-day pickup from neighborhood data, by the property's bedroom category
+  const marketPickup = {};
+  for (const p of plProps()) {
+    const a = alertData?.[p.plId];
+    if (a?.market) marketPickup[p.id] = parseMarketPickup(a.market, a.settings?.no_of_bedrooms ?? 1, p.name, todayStr);
+  }
+
+  // Forecast basis: booked gross ÷ PriceLabs price per property
+  const forecastRatios = plData ? bookedPriceRatios(bookings, plData, todayStr) : null;
+  if (forecastRatios) console.log(`  Forecast ratios: ${ratioNote(forecastRatios)}`);
+
   // Priority Action Board: per-property summary with action items
   console.log('  Building Priority Action Board...');
   const { summaries, portfolioNote } = buildPropertySummaries(
@@ -2513,9 +2831,9 @@ async function main() {
     sectionPricingAlerts(plData, alertData, bookings, todayStr),
     sectionSmartEvents(hardcodedEvents, cachedEvents, plData, histActive ?? [], todayStr),
     sectionOpenNights(bookings, todayStr, taxProfiles, plData),
-    paceData  ? sectionBookingPace(tyBookings, lyBookings, paceMonths, todayStr) : sectionUnavailable('section-pace', '📈 Booking Pace vs Last Year'),
+    paceData  ? sectionBookingPace(paceData, paceMonths, todayStr, pickup, lastBookedMap, marketPickup) : sectionUnavailable('section-pace', '📈 Booking Pace vs Last Year'),
     paceData && forecastData
-      ? sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData)
+      ? sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, histActive, histBlocked, plData, forecastRatios)
       : sectionUnavailable('section-forecast', '🔮 Revenue Forecast'),
     sectionPrices(bookings, plData, todayStr, alertData),
   ];

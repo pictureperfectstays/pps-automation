@@ -174,8 +174,9 @@ body: { listings: [{ id: "471179", pms: "ownerrez", min: 105, base: 228 }] }
   - No AI API needed — pure JavaScript, always runs
   - Aggregates actionable items from every section, ranked by priority:
     1. Data failures | 2. Cancellations since the last report | 3. 1-night gaps (next 14 days)
-    4. RED pricing alerts | 5. YELLOW pricing alerts | 6. No recent bookings with open nights
-    7. Booking pace behind LY | 8. Underpriced events (one per property, last, no jump link)
+    4. 7-day pickup behind market (YELLOW: our nights < ½ market per listing, market ≥ 1/listing; skipped if market pickup unavailable; context line: booked % (market occ) and open nights for days 1–30 and 31–60)
+    5. RED pricing alerts | 6. YELLOW pricing alerts | 7. No recent bookings with open nights
+    8. Booking pace behind LY | 9. Underpriced events (one per property, last, no jump link)
   - Events otherwise stay in the Events section, not on the board
   - Data: reuses plData, alertData, bookings, events; adds MAX(booked_at) Supabase query per property
   - Each item has a color-coded badge, specific dollar amounts (bolded), and a "↓ Jump" anchor link

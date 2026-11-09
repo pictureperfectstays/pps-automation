@@ -2601,7 +2601,12 @@ function alertBecause(a) {
   return `Average price ${fmt$(a.avgPrice)} is above your ${range}.${occStr}`;
 }
 
-function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, activity, mtd, tyBookings, lyBookings, paceMonths, hardcodedEvents, cachedEvents, histActive, todayStr) {
+// Pickup-behind-market board rule: flag when our 7-day nights < ratio × market per listing,
+// only when the market picked up at least PICKUP_MARKET_MIN nights per listing
+const PICKUP_MARKET_RATIO = 0.5;
+const PICKUP_MARKET_MIN = 1;
+
+function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, activity, mtd, tyBookings, lyBookings, paceMonths, hardcodedEvents, cachedEvents, histActive, todayStr, pickup = null, marketPickup = {}) {
   const now = new Date();
   const t14 = addDays(todayStr, 14);
 
@@ -2634,7 +2639,8 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
 
     // ── Action items ─────────────────────────────────────────────────────────
     // Priority (1 = first): 1 failures · 2 cancellations · 3 1-night gaps (14 days)
-    // · 4 RED pricing · 5 YELLOW pricing · 6 no recent bookings · 7 pace · 8 underpriced events
+    // · 4 pickup behind market · 5 RED pricing · 6 YELLOW pricing · 7 no recent bookings
+    // · 8 pace · 9 underpriced events
     const actions = [];
 
     // Cancellations for this property since the last report (fully rebooked ones stay in Activity only)
@@ -2664,7 +2670,7 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
         if (a.level === 'OK') continue;
         actions.push({
           level: a.level === 'RED' ? 'red' : 'yellow',
-          priority: a.level === 'RED' ? 4 : 5,
+          priority: a.level === 'RED' ? 5 : 6,
           anchor: '#section-pricing', sectionLabel: 'Pricing Alerts',
           text: `${a.window}: ${alertBecause(a)}`,
         });
@@ -2696,7 +2702,7 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
         return `${dStr} ${e.names.join(', ')} (−${e.pct}%)`;
       }).join('; ');
       actions.push({
-        level: 'event', priority: 8, sortKey: nightOf(entries[0]), anchor: null,
+        level: 'event', priority: 9, sortKey: nightOf(entries[0]), anchor: null,
         text: `Event nights priced below their historical ADR: ${list}. Consider raising prices in PriceLabs; see Events.`,
       });
     }
@@ -2704,7 +2710,7 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
     // No new bookings in 14+ days with open nights
     if (plData && daysSince != null && daysSince >= 14 && openNext30 > 0) {
       actions.push({
-        level: 'watch', priority: 6, anchor: '#section-pricing', sectionLabel: 'Pricing',
+        level: 'watch', priority: 7, anchor: '#section-pricing', sectionLabel: 'Pricing',
         text: `No new bookings in ${daysSince} days with ${openNext30} open night${openNext30 !== 1 ? 's' : ''} available in the next 30 days. Check listing rank, photos, and reviews across all channels.`,
       });
     }
@@ -2721,6 +2727,34 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
       });
     }
 
+    // 7-day pickup behind market: our nights booked in the last 7 days (on the books
+    // today, any stay dates) under half the market's 7-day pickup per listing (same
+    // scope), only when the market picked up at least 1 night per listing. Skipped
+    // when either figure is missing (e.g. the 12-month offset check failed).
+    const mkPick = marketPickup?.[prop.id];
+    if (pickup && mkPick?.perListing != null && mkPick.perListing >= PICKUP_MARKET_MIN) {
+      const ourNights = pickup.ty
+        .filter(b => b.property_id === prop.id && Date.parse(b.booked_at) >= Date.parse(pickup.tyFrom7))
+        .reduce((n, b) => n + (Number(b.nights) || 0), 0);
+      if (ourNights < mkPick.perListing * PICKUP_MARKET_RATIO) {
+        const x = (Math.round(mkPick.perListing * 10) / 10).toFixed(1);
+        // Context: booked % and open nights from our bookings (same counts as the Open
+        // Nights section); market occupancy from PriceLabs (same as Pricing Alerts)
+        const windowCtx = (label, fromDay, toDay, short) => {
+          const open = openDates(bookings, prop.id, addDays(todayStr, fromDay), addDays(todayStr, toDay)).length;
+          const span = toDay - fromDay;
+          const bookedPct = Math.round((span - open) / span * 100);
+          const mkt = settings ? windowOcc(settings.market_occupancy_next_30, settings.market_occupancy_next_60, toDay) : null;
+          return `${label}: ${bookedPct}%${short ? '' : ' booked'}${mkt != null ? ` (market ${Math.round(mkt * 100)}%)` : ''}, ${open} open.`;
+        };
+        actions.push({
+          level: 'yellow', priority: 4, anchor: '#section-pace', sectionLabel: 'Booking Pace',
+          text: `${prop.name}: ${ourNights} night${ourNights !== 1 ? 's' : ''} picked up in 7 days vs. market ${x} per listing. Check price position, minimum stay, and listing visibility.`,
+          detail: `${windowCtx('Days 1–30', 0, 30, false)} ${windowCtx('Days 31–60', 30, 60, true)}`,
+        });
+      }
+    }
+
     // Booking pace >20% behind LY for first pace month (LY measured against LY's month)
     const pm = paceMonths[0];
     let tyRev = 0, lyRev = 0;
@@ -2729,7 +2763,7 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
     if (hasPriorYear(prop, pm.lyStart) && lyRev > 200 && tyRev < lyRev * 0.80) {
       const pct = Math.round((1 - tyRev / lyRev) * 100);
       actions.push({
-        level: 'watch', priority: 7, anchor: '#section-pace', sectionLabel: 'Booking Pace',
+        level: 'watch', priority: 8, anchor: '#section-pace', sectionLabel: 'Booking Pace',
         text: `${pm.label} bookings are ${pct}% behind last year (${fmt$(Math.round(tyRev))} vs ${fmt$(Math.round(lyRev))}). Consider a promotion or price adjustment to stimulate demand.`,
       });
     }
@@ -2766,7 +2800,7 @@ function sectionPriorityBoard({ summaries, portfolioNote }, todayStr) {
   const shown = new Set(
     summaries.flatMap(s => s.actions)
       .map((a, i) => ({ a, i }))
-      .sort((x, y) => (x.a.priority ?? 9) - (y.a.priority ?? 9)
+      .sort((x, y) => (x.a.priority ?? 99) - (y.a.priority ?? 99)
         || (x.a.sortKey ?? '').localeCompare(y.a.sortKey ?? '') || x.i - y.i)
       .slice(0, BOARD_LIMIT)
       .map(x => x.a)
@@ -2801,7 +2835,8 @@ function sectionPriorityBoard({ summaries, portfolioNote }, todayStr) {
         const c    = ACTION_COLOR[a.level] || '#555';
         const jump = !a.anchor ? '' : `<a href="${a.anchor}" style="font-size:11px;color:#406A94;text-decoration:none;font-weight:600;margin-left:10px;white-space:nowrap;">↓ ${a.sectionLabel}</a>`;
         const sep  = i < top.length - 1 || rest ? 'border-bottom:1px solid #f3f4f6;' : '';
-        return `<div style="padding:8px 0;${sep}font-size:13px;line-height:1.5;color:${c};">→ ${boldDollars(a.text)}${jump}</div>`;
+        const detail = a.detail ? `<div style="font-size:11px;color:#777;margin-top:2px;">${a.detail}</div>` : '';
+        return `<div style="padding:8px 0;${sep}font-size:13px;line-height:1.5;color:${c};">→ ${boldDollars(a.text)}${jump}${detail}</div>`;
       }).join('');
       const more = rest
         ? `<div style="padding:8px 0;font-size:12px;color:#888;">${prop.name}: ${rest} more item${rest !== 1 ? 's' : ''} (see the sections below)</div>`
@@ -2962,7 +2997,8 @@ async function main() {
   const { summaries, portfolioNote } = buildPropertySummaries(
     plData, alertData, bookings, lastBookedMap,
     activity ?? { newBookings: [], cancellations: [] }, mtd,
-    tyBookings ?? [], lyBookings ?? [], paceMonths, hardcodedEvents, cachedEvents, histActive, todayStr);
+    tyBookings ?? [], lyBookings ?? [], paceMonths, hardcodedEvents, cachedEvents, histActive, todayStr,
+    pickup, marketPickup);
   const priorityBoardHtml = sectionPriorityBoard({ summaries, portfolioNote }, todayStr);
   const totalActions = summaries.reduce((n, s) => n + s.actions.length, 0);
   console.log(`  ✓ Priority Action Board: ${totalActions} action items across ${summaries.length} properties`);

@@ -9,6 +9,7 @@ import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 import { getHardcodedEvents, MARKETS } from './events-calendar.js';
+import { cleanCachedWebEvents } from './event-rules.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ─── Credentials ─────────────────────────────────────────────────────────────
@@ -575,8 +576,6 @@ function taxRateOn(taxProfiles, propId, date) {
 // so it should never be more than 4 days old; 6 allows one missed scan.
 const EVENTS_CACHE_MAX_AGE_DAYS = 6;
 
-const JUNK_EVENT_NAME = /^\s*events from\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b/i;
-
 function fetchEventsCache(todayStr) {
   try {
     const cachePath = join(__dirname, 'events-cache.json');
@@ -589,11 +588,14 @@ function fetchEventsCache(todayStr) {
     if (!scanDate || diffDays(scanDate, todayStr) > EVENTS_CACHE_MAX_AGE_DAYS) {
       recordWarning('Events cache', `Last event scan was ${scanDate ? fmtDate(scanDate) : 'never'}; Ticketmaster and ESPN events may be out of date. Check the Event Discovery Scan workflow.`);
     }
-    // Web-search entries named after a listing page ("Events from July 9") aren't events
-    const events = (data.events || []).filter(ev => !JUNK_EVENT_NAME.test(ev.name || ''));
-    const junk = (data.events || []).length - events.length;
-    if (junk) console.log(`  Events cache: skipped ${junk} listing-page entr${junk !== 1 ? 'ies' : 'y'} ("Events from [date]")`);
-    return events;
+    // Same cleanup the event scan applies (event-rules.js), so junk web-search entries
+    // never reach the report even if a scan is late or fails
+    const { kept, dropped } = cleanCachedWebEvents(data.events || []);
+    if (dropped.length) {
+      console.log(`  Events cache: skipped ${dropped.length} web-search entr${dropped.length !== 1 ? 'ies' : 'y'} (listing pages, social posts, bad dates):`);
+      for (const ev of dropped) console.log(`    - ${ev.name} (${ev.start_date} – ${ev.end_date})`);
+    }
+    return kept;
   } catch (e) {
     recordFailure('Events cache', `events-cache.json could not be read (${e.message}); only hard-coded events are shown.`);
     return [];

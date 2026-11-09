@@ -473,7 +473,7 @@ async function fetchPickupData() {
   const lyNow = now - 365 * DAY;
   const ids = propIdList();
   const [ty, lyRows] = await Promise.all([
-    sb(`bookings?select=property_id,gross_revenue,booked_at&property_id=in.(${ids})&status=eq.active&booked_at=gte.${isoAt(now - 15 * DAY)}`),
+    sb(`bookings?select=property_id,nights,gross_revenue,booked_at&property_id=in.(${ids})&status=eq.active&booked_at=gte.${isoAt(now - 15 * DAY)}`),
     sb(`bookings?select=${CANCEL_SELECT}&property_id=in.(${ids})&status=in.(active,canceled)&booked_at=gte.${isoAt(lyNow - 15 * DAY)}&booked_at=lte.${isoAt(lyNow)}`),
   ]);
   const ly = lyRows.filter(b => onBooksAt(b, isoAt(lyNow))).map(asItStood);
@@ -853,31 +853,110 @@ function percentileSeriesIndex(series, category, propName) {
   return byPct;
 }
 
-// Market 7-day pickup from neighborhood_data "Market KPI": series labelled
-// "7 Day Pickup" and "7 Day Pickup STLY" (matched by label), by bedroom category
-// and month. Returns { month, pickup, stly } for the current month, or null.
-// Logs the labels, months and values so the unit can be confirmed.
+// "Listings Used" for a bedroom category. PriceLabs puts it in each category,
+// next to X_values / Y_values: data["Market KPI"].Category[<bedrooms>]["Listings Used"].
+// If it isn't there, a search for a matching key (in the section, then anywhere
+// in the response, as a number or an object keyed by bedroom count) is the
+// fallback, with a warning. The top-level data["Listings Used"] is the total
+// across all bedroom categories and is never used.
+// Returns { value, path, fallback } or null.
+function findListingsUsed(marketData, kpi, category, bedroomKey, propName) {
+  const direct = Number(category?.['Listings Used']);
+  if (category?.['Listings Used'] != null && Number.isFinite(direct)) return { value: direct, path: `Market KPI.Category.${bedroomKey}.Listings Used`, fallback: false };
+  const found = searchListingsUsed(marketData, kpi, category, bedroomKey);
+  if (found) recordWarning('Market pickup', `${propName}: "Listings Used" not in the ${bedroomKey}-bedroom category; used ${found.value} from ${found.path} instead.`);
+  return found ? { ...found, fallback: true } : null;
+}
+function searchListingsUsed(marketData, kpi, category, bedroomKey) {
+  const RX = /listings\s*_?\s*used/i;
+  const isTopLevelTotal = (path, v) => path === 'response.data' && typeof v !== 'object';
+  const asNumber = v => {
+    if (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '' && !isNaN(Number(v)))) return Number(v);
+    if (Array.isArray(v)) return asNumber(v.flat(Infinity)[0]);
+    if (v && typeof v === 'object') return asNumber(v[bedroomKey] ?? v.Category?.[bedroomKey]);
+    return null;
+  };
+  const search = (obj, path, depth) => {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj) || depth > 4) return null;
+    for (const [k, v] of Object.entries(obj)) {
+      if (RX.test(k) && !isTopLevelTotal(path, v)) { const n = asNumber(v); if (n != null) return { value: n, path: `${path}.${k}` }; }
+    }
+    for (const [k, v] of Object.entries(obj)) {
+      if (k === 'Category' && v?.[bedroomKey]) { const r = search(v[bedroomKey], `${path}.Category.${bedroomKey}`, depth + 1); if (r) return r; continue; }
+      if (k === 'Category') continue; // other bedroom counts
+      const r = search(v, `${path}.${k}`, depth + 1); if (r) return r;
+    }
+    return null;
+  };
+  return search(category, 'category', 0) || search(kpi, 'kpi', 0) || search(marketData, 'response', 0);
+}
+
+// Market 7-day pickup from neighborhood_data "Market KPI", series matched by
+// label, for the property's bedroom category.
+// PriceLabs puts forward-looking series (Future Booked Days, STLY, 7 Day Pickup)
+// for month M in the row labelled M minus 12 months. The offset is checked on
+// every run: Future Booked Days in the offset row must equal Total Booked Days
+// in the current month's row; otherwise the column is left blank with a warning.
+// Pickup is summed over every forward month (current month onward), the same
+// scope as our own pickup (bookings made in the window, any stay dates), and
+// shown in nights per listing (÷ the category's "Listings Used").
+// Returns { pickup, stly, listings, perListing, stlyPerListing, thisMonth } or
+// null; logs the inputs.
+const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 function parseMarketPickup(marketData, bedroomCount, propName, todayStr) {
   const kpiKey = Object.keys(marketData?.data || {}).find(k => /market\s*kpi/i.test(k));
   const kpi = kpiKey ? marketData.data[kpiKey] : null;
+  const warn = detail => { recordWarning('Market pickup', `${propName}: ${detail}; market column left blank.`); return null; };
   if (!kpi?.Category) {
     console.log(`  Market pickup for ${propName}: no "Market KPI" in neighborhood data (sections: ${Object.keys(marketData?.data || {}).join(', ')})`);
-    return null;
+    return warn('no "Market KPI" in PriceLabs neighborhood data');
   }
   const category = marketCategory(kpi, kpiKey, bedroomCount, propName);
-  if (!category) return null;
+  if (!category) return warn('no bedroom category in "Market KPI"');
   const yVals = category.Y_values || [];
   const isLabelList = v => Array.isArray(v) && v.length === yVals.length && v.every(x => typeof x === 'string');
   const labels = [category, kpi].flatMap(o => Object.values(o || {})).find(isLabelList) || [];
-  const iPick = labels.findIndex(l => /^\s*7\s*day\s*pickup\s*$/i.test(l));
-  const iStly = labels.findIndex(l => /^\s*7\s*day\s*pickup\s*stly\s*$/i.test(l));
-  const months = category.X_values || [];
+  const idx = rx => labels.findIndex(l => rx.test(l));
+  const iPick   = idx(/^\s*7\s*day\s*pickup\s*$/i);
+  const iStly   = idx(/^\s*7\s*day\s*pickup\s*stly\s*$/i);
+  const iTotal  = idx(/^\s*total\s*booked\s*days\s*$/i);
+  const iFuture = idx(/^\s*future\s*booked\s*days\s*$/i);
+  const months = (category.X_values || []).map(String);
   const first = v => (Array.isArray(v) ? first(v[0]) : v); // some series are nested
-  const valueAt = (si, mi) => (si < 0 ? null : first((yVals[si] || [])[mi]) ?? null);
-  const mi = months.findIndex(x => String(x).slice(0, 7) === todayStr.slice(0, 7));
-  console.log(`  Market pickup for ${propName}: labels ${JSON.stringify(labels)} · months ${JSON.stringify(months)} · 7 Day Pickup ${JSON.stringify((yVals[iPick] || []).map(first))} · STLY ${JSON.stringify((yVals[iStly] || []).map(first))}`);
-  if (iPick < 0 || mi < 0) return null;
-  return { month: months[mi], pickup: valueAt(iPick, mi), stly: valueAt(iStly, mi) };
+  const valueAt = (si, mi) => (si < 0 || mi < 0 ? null : first((yVals[si] || [])[mi]) ?? null);
+
+  const [y, m] = todayStr.split('-').map(Number);
+  const curLabel = `${MONTH_ABBR[m - 1]} ${y}`, offLabel = `${MONTH_ABBR[m - 1]} ${y - 1}`;
+  const cur = months.findIndex(x => x.trim() === curLabel);
+  const off = months.findIndex(x => x.trim() === offLabel);
+  // Forward rows: the offset row through the last month-labelled row
+  const isMonth = x => /^[A-Za-z]{3}\s+\d{4}$/.test(x.trim());
+  let lastMonthRow = off;
+  while (lastMonthRow + 1 < months.length && isMonth(months[lastMonthRow + 1])) lastMonthRow++;
+
+  const listings = findListingsUsed(marketData, kpi, category, String(bedroomCount), propName);
+  const futureOff = valueAt(iFuture, off), totalCur = valueAt(iTotal, cur);
+  console.log(`  Market pickup for ${propName}: rows ${offLabel} (offset) / ${curLabel} (current) · Future Booked Days ${futureOff} vs Total Booked Days ${totalCur} · Listings Used ${listings ? `${listings.value} at ${listings.path}` : 'not found'} · 7 Day Pickup ${JSON.stringify((yVals[iPick] || []).map(first))} · STLY ${JSON.stringify((yVals[iStly] || []).map(first))}`);
+  if (!listings) console.log(`    response keys: ${JSON.stringify(Object.keys(marketData || {}))} · data keys: ${JSON.stringify(Object.keys(marketData?.data || {}))} · ${kpiKey} keys: ${JSON.stringify(Object.keys(kpi))} · category keys: ${JSON.stringify(Object.keys(category))}`);
+
+  if (iPick < 0) return warn('no "7 Day Pickup" series');
+  if (cur < 0 || off < 0) return warn(`month rows ${curLabel} / ${offLabel} not found`);
+  if (iTotal < 0 || iFuture < 0) return warn('"Total Booked Days" / "Future Booked Days" series missing, so the 12-month offset can\'t be checked');
+  if (futureOff == null || totalCur == null || Math.abs(Number(futureOff) - Number(totalCur)) >= 0.5)
+    return warn(`12-month offset check failed (Future Booked Days in ${offLabel} = ${futureOff}, Total Booked Days in ${curLabel} = ${totalCur})`);
+  if (!listings || !(listings.value > 0)) return warn('"Listings Used" not found in PriceLabs neighborhood data');
+
+  let pickup = 0, stly = 0, stlyFound = iStly >= 0;
+  for (let r = off; r <= lastMonthRow; r++) {
+    pickup += Number(valueAt(iPick, r)) || 0;
+    if (stlyFound) stly += Number(valueAt(iStly, r)) || 0;
+  }
+  return {
+    pickup, stly: stlyFound ? stly : null, listings: listings.value,
+    perListing: pickup / listings.value,
+    stlyPerListing: stlyFound ? stly / listings.value : null,
+    thisMonth: Number(valueAt(iPick, off)) || 0,
+  };
 }
 
 // Build date → { p25, p50, p75, p90 } lookup from neighborhood_data for a given bedroom count.
@@ -1258,6 +1337,8 @@ function computeLYActual(prop, paceMonth, histActive) {
 // portfolio ratio (from properties that pass both) is used.
 const FORECAST_RATIO_MIN_NIGHTS = 7;
 const FORECAST_RATIO_RANGE = [0.8, 2.0];
+// Years of late-booked history used to cap the value of an open night
+const LATE_ADR_YEARS = 3;
 function bookedPriceRatios(bookings, plData, todayStr) {
   const t90 = addDays(todayStr, 90);
   const sums = {};
@@ -1382,11 +1463,19 @@ function computePropertyForecast(prop, paceMonth, todayStr, tyBookings, tyBlocke
       while (dt < b.departure_date && dt < lyEnd) { lyAtPointDates.add(dt); dt = addDays(dt, 1); }
     }
 
-    // Total nights confirmed by month-end
+    // Total nights confirmed by month-end; nights booked after the same point
+    // also record what they earned (stay gross ÷ nights)
     const lyTotalDates = new Set();
+    let lateNights = 0, lateGross = 0;
     for (const b of lyMonthBookings) {
+      const late = !b.booked_at || b.booked_at.slice(0, 10) > samePoint;
+      const perNight = b.nights > 0 ? (Number(b.gross_revenue) || 0) / b.nights : 0;
       let dt = b.arrival_date < lyStart ? lyStart : b.arrival_date;
-      while (dt < b.departure_date && dt < lyEnd) { lyTotalDates.add(dt); dt = addDays(dt, 1); }
+      while (dt < b.departure_date && dt < lyEnd) {
+        lyTotalDates.add(dt);
+        if (late && !lyAtPointDates.has(dt)) { lateNights++; lateGross += perNight; }
+        dt = addDays(dt, 1);
+      }
     }
 
     const lyOpenAtPoint = Math.max(0, lyAvailable - lyAtPointDates.size);
@@ -1398,8 +1487,16 @@ function computePropertyForecast(prop, paceMonth, todayStr, tyBookings, tyBlocke
 
     const lyFilled  = Math.max(0, lyTotalDates.size - lyAtPointDates.size);
     const fillRate  = Math.min(1.0, lyFilled / lyOpenAtPoint);
-    fillRates.push({ yr, fillRate, openAtPoint: lyOpenAtPoint, filled: lyFilled });
+    fillRates.push({ yr, fillRate, openAtPoint: lyOpenAtPoint, filled: lyFilled, lateNights, lateGross });
   }
+
+  // What late-booked nights earned in this month: pooled over the most recent
+  // LATE_ADR_YEARS fill-rate years that had late bookings (fewer if that's all
+  // the history there is)
+  const lateYears = fillRates.filter(r => r.lateNights > 0).slice(0, LATE_ADR_YEARS);
+  const lateNightsSum = lateYears.reduce((s, r) => s + r.lateNights, 0);
+  const lateADR = lateNightsSum > 0 ? lateYears.reduce((s, r) => s + r.lateGross, 0) / lateNightsSum : null;
+  const lateADRYears = lateYears.map(r => r.yr);
 
   // LY actual revenue (no booked_at filter — final month-end result); null before
   // the property's first full month
@@ -1424,7 +1521,15 @@ function computePropertyForecast(prop, paceMonth, todayStr, tyBookings, tyBlocke
   const avgPLPrice      = pricedOpenDates.length > 0
     ? pricedOpenDates.reduce((s, d) => s + propPrices[d].price, 0) / pricedOpenDates.length
     : null;
-  const avgPrice = avgPLPrice != null && ratioInfo?.ratio ? avgPLPrice * ratioInfo.ratio : null;
+  const plValue  = avgPLPrice != null && ratioInfo?.ratio ? avgPLPrice * ratioInfo.ratio : null;
+  // Valued at the lower of today's price × ratio and what late-booked nights earned
+  const priceCapped = plValue != null && lateADR != null && lateADR < plValue;
+  const avgPrice    = priceCapped ? lateADR : plValue;
+
+  // Expected nights filled (base) vs nights filled after this point in past years
+  const expectedNights = openNights * Math.min(1.0, avgFillRate);
+  const pastFilled     = fillRates.map(r => r.filled);
+  const pastRange      = pastFilled.length ? [Math.min(...pastFilled), Math.max(...pastFilled)] : null;
 
   const scenario = (mult) => {
     if (openNights === 0) return confirmedRevenue; // Fully booked — confirmed is the projection
@@ -1440,7 +1545,8 @@ function computePropertyForecast(prop, paceMonth, todayStr, tyBookings, tyBlocke
 
   return {
     prop, paceMonth, confirmedRevenue, confirmedNights, openNights, availableDays,
-    avgFillRate, avgPrice, fillRates, fullyBookedYears,
+    avgFillRate, avgPrice, plValue, lateADR, lateADRYears, priceCapped,
+    expectedNights, pastRange, fillRates, fullyBookedYears,
     conservative, base, optimistic, lyActualRevenue,
     isFullyBooked, isRedFlag,
   };
@@ -1565,21 +1671,22 @@ function sectionMTD(mtd, todayStr) {
 function pickupTable(pickup, lastBookedMap, marketPickup) {
   const win = (rows, from7) => {
     const r = {};
-    for (const p of PROPERTIES) r[p.id] = { n7: 0, g7: 0, n15: 0, g15: 0 };
+    for (const p of PROPERTIES) r[p.id] = { n7: 0, nt7: 0, g7: 0, n15: 0, nt15: 0, g15: 0 };
     for (const b of rows) {
       const x = r[b.property_id]; if (!x) continue;
-      const g = Number(b.gross_revenue) || 0;
-      x.n15++; x.g15 += g;
-      if (Date.parse(b.booked_at) >= Date.parse(from7)) { x.n7++; x.g7 += g; }
+      const g = Number(b.gross_revenue) || 0, nt = Number(b.nights) || 0;
+      x.n15++; x.nt15 += nt; x.g15 += g;
+      if (Date.parse(b.booked_at) >= Date.parse(from7)) { x.n7++; x.nt7 += nt; x.g7 += g; }
     }
     return r;
   };
   const ty = win(pickup.ty, pickup.tyFrom7), ly = win(pickup.ly, pickup.lyFrom7);
   const lyWindowStart = isoAt(Date.parse(pickup.lyFrom7) - 8 * 86400000).slice(0, 10);
-  const cell = (n, g) => `${n} · ${fmt$(g)}`;
+  const cell = (n, nt, g) => `${n} · ${nt} nt${nt !== 1 ? 's' : ''} · ${fmt$(g)}`;
   const TDR = 'padding:7px 12px;border-bottom:1px solid #f0f0f0;text-align:right;';
   const NO_PY = '<span style="font-size:11px;color:#aaa;">No prior year</span>';
-  const tot = { ty: { n7: 0, g7: 0, n15: 0, g15: 0 }, ly: { n7: 0, g7: 0, n15: 0, g15: 0 } };
+  const zero = () => ({ n7: 0, nt7: 0, g7: 0, n15: 0, nt15: 0, g15: 0 });
+  const tot = { ty: zero(), ly: zero() };
   let rows = '';
   PROPERTIES.forEach((p, i) => {
     const t = ty[p.id], l = ly[p.id];
@@ -1590,24 +1697,25 @@ function pickupTable(pickup, lastBookedMap, marketPickup) {
     const flag = quietDays != null && quietDays >= 14
       ? `<div style="font-size:10px;color:#c0392b;font-weight:600;">No new bookings in ${quietDays} days</div>` : '';
     const mk = marketPickup?.[p.id];
-    const mkCell = mk?.pickup != null
-      ? `${Math.round(mk.pickup * 10) / 10}${mk.stly != null ? `<div style="font-size:10px;color:#aaa;">STLY ${Math.round(mk.stly * 10) / 10}</div>` : ''}`
+    const oneDp = v => (Math.round(v * 10) / 10).toFixed(1);
+    const mkCell = mk?.perListing != null
+      ? `${oneDp(mk.perListing)} nts${mk.stlyPerListing != null ? `<div style="font-size:10px;color:#aaa;">STLY ${oneDp(mk.stlyPerListing)}</div>` : ''}`
       : '<span style="font-size:11px;color:#aaa;">—</span>';
     rows += groupRow(p, i, 6) + `<tr>
       <td style="padding:7px 12px;border-bottom:1px solid #f0f0f0;">${tag(p)}${flag}</td>
-      <td style="${TDR}font-weight:600;">${cell(t.n7, t.g7)}</td>
-      <td style="${TDR}color:#666;">${prior ? cell(l.n7, l.g7) : NO_PY}</td>
-      <td style="${TDR}font-weight:600;">${cell(t.n15, t.g15)}</td>
-      <td style="${TDR}color:#666;">${prior ? cell(l.n15, l.g15) : NO_PY}</td>
+      <td style="${TDR}font-weight:600;">${cell(t.n7, t.nt7, t.g7)}</td>
+      <td style="${TDR}color:#666;">${prior ? cell(l.n7, l.nt7, l.g7) : NO_PY}</td>
+      <td style="${TDR}font-weight:600;">${cell(t.n15, t.nt15, t.g15)}</td>
+      <td style="${TDR}color:#666;">${prior ? cell(l.n15, l.nt15, l.g15) : NO_PY}</td>
       <td style="${TDR}">${mkCell}</td>
     </tr>`;
   });
   rows += `<tr style="background:#f8f9fa;">
     <td style="padding:7px 12px;font-weight:700;">Portfolio Total</td>
-    <td style="padding:7px 12px;text-align:right;font-weight:700;">${cell(tot.ty.n7, tot.ty.g7)}</td>
-    <td style="padding:7px 12px;text-align:right;color:#666;">${cell(tot.ly.n7, tot.ly.g7)}</td>
-    <td style="padding:7px 12px;text-align:right;font-weight:700;">${cell(tot.ty.n15, tot.ty.g15)}</td>
-    <td style="padding:7px 12px;text-align:right;color:#666;">${cell(tot.ly.n15, tot.ly.g15)}</td>
+    <td style="padding:7px 12px;text-align:right;font-weight:700;">${cell(tot.ty.n7, tot.ty.nt7, tot.ty.g7)}</td>
+    <td style="padding:7px 12px;text-align:right;color:#666;">${cell(tot.ly.n7, tot.ly.nt7, tot.ly.g7)}</td>
+    <td style="padding:7px 12px;text-align:right;font-weight:700;">${cell(tot.ty.n15, tot.ty.nt15, tot.ty.g15)}</td>
+    <td style="padding:7px 12px;text-align:right;color:#666;">${cell(tot.ly.n15, tot.ly.nt15, tot.ly.g15)}</td>
     <td style="padding:7px 12px;"></td>
   </tr>`;
   const missing = pickup.lyAmountsMissing
@@ -1619,10 +1727,10 @@ function pickupTable(pickup, lastBookedMap, marketPickup) {
         <th style="${TH}">Property</th>
         <th style="${TH}text-align:right;">Last 7 Days</th><th style="${TH}text-align:right;">Same 7 LY</th>
         <th style="${TH}text-align:right;">Last 15 Days</th><th style="${TH}text-align:right;">Same 15 LY</th>
-        <th style="${TH}text-align:right;">Market 7-Day<br><span style="font-weight:400;font-size:10px;">PriceLabs, this month</span></th>
+        <th style="${TH}text-align:right;">Market 7-Day<br><span style="font-weight:400;font-size:10px;">nights per listing</span></th>
       </tr>${rows}
     </table>
-    <p style="font-size:11px;color:#aaa;margin:6px 0 0;">Bookings made in the window and still on the books (count · full-stay gross). Last year counts bookings made in the same windows that were on the books then, including ones cancelled later. Market 7-Day = PriceLabs "7 Day Pickup" for the property's bedroom category this month, with the same time last year (STLY).${missing}</p>
+    <p style="font-size:11px;color:#aaa;margin:6px 0 0;">Bookings made in the window and still on the books (bookings · nights · full-stay gross). Last year counts bookings made in the same windows that were on the books then, including ones cancelled later. Market 7-Day = PriceLabs "7 Day Pickup" for the property's bedroom category, all stay months from this month on, ÷ the category's listings, so it compares with our Last 7 Days nights (one listing). STLY = same time last year, ÷ today's listing count.${missing}</p>
   </div>`;
 }
 
@@ -1779,8 +1887,11 @@ function sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, his
       } else {
         const pct  = Math.round(f.avgFillRate * 100);
         const yrs  = f.fillRates.length;
+        const exp  = Math.round(f.expectedNights * 10) / 10;
+        const past = f.pastRange ? (f.pastRange[0] === f.pastRange[1] ? `${f.pastRange[0]}` : `${f.pastRange[0]}–${f.pastRange[1]}`) : '—';
         fillRateCell = `<td style="padding:7px 10px;text-align:right;">${pct}%
-          <div style="font-size:10px;color:#aaa;">n=${yrs} yr${yrs !== 1 ? 's' : ''}</div></td>`;
+          <div style="font-size:10px;color:#aaa;">n=${yrs} yr${yrs !== 1 ? 's' : ''}</div>
+          <div style="font-size:10px;color:#666;white-space:nowrap;">exp. ${exp} nts · past ${past}</div></td>`;
       }
 
       // Scenario cells
@@ -1815,7 +1926,8 @@ function sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, his
       // Open nights cell — show avg PL price as subtext
       const openNtsCell = f.isFullyBooked
         ? `<td style="padding:7px 10px;text-align:right;color:#1a7f5a;">0</td>`
-        : `<td style="padding:7px 10px;text-align:right;">${f.openNights}${f.avgPrice ? `<div style="font-size:10px;color:#aaa;">avg ${fmt$(Math.round(f.avgPrice))}/nt</div>` : ''}</td>`;
+        : `<td style="padding:7px 10px;text-align:right;">${f.openNights}${f.avgPrice ? `<div style="font-size:10px;color:#aaa;">avg ${fmt$(Math.round(f.avgPrice))}/nt</div>` : ''}${f.priceCapped
+            ? `<div style="font-size:10px;color:#aaa;white-space:nowrap;">late-booked avg; PL ${fmt$(Math.round(f.plValue))}</div>` : ''}</td>`;
 
       const lyColor = f.isRedFlag ? '#c0392b' : '#666';
       rows += `<tr style="background:${rowBg};border-bottom:1px solid #f0f0f0;">
@@ -1882,8 +1994,8 @@ function sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, his
 
   html += `<p style="font-size:11px;color:#aaa;margin:8px 0 0;">
     All amounts are gross (cleaning and taxes included), prorated for bookings spanning month boundaries.
-    Open nights are valued at the PriceLabs price × each property's booked-gross ratio (booked gross ÷ PriceLabs price on its booked nights in the next 90 days): ${ratioNote(ratios)}.
-    Fill rate = % of open nights at this same calendar date historically that were booked by month-end, averaged across all available prior years.
+    Open nights are valued at the lower of (a) the PriceLabs price × each property's booked-gross ratio (booked gross ÷ PriceLabs price on its booked nights in the next 90 days: ${ratioNote(ratios)}) and (b) the average gross per night that nights booked after this calendar date earned in the same month over the last ${LATE_ADR_YEARS} years with such bookings (fewer if that's all the history). "late-booked avg" marks where (b) is used, with (a) shown as PL.
+    Fill rate = % of open nights at this same calendar date historically that were booked by month-end, averaged across all available prior years. exp. = open nights × fill rate (base); past = nights filled after this date in those years (lowest–highest).
     Scenarios: Conservative = 50% of fill rate · Base = 100% · Optimistic = 130%.
     <span style="display:inline-block;background:#fff5f5;color:#c0392b;padding:1px 5px;border-radius:3px;margin-top:2px;">Red row</span> = base projection &gt;15% below last year's actual.
   </p>`;

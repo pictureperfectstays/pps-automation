@@ -2738,9 +2738,19 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
         .reduce((n, b) => n + (Number(b.nights) || 0), 0);
       if (ourNights < mkPick.perListing * PICKUP_MARKET_RATIO) {
         const x = (Math.round(mkPick.perListing * 10) / 10).toFixed(1);
+        // Context: booked % and open nights from our bookings (same counts as the Open
+        // Nights section); market occupancy from PriceLabs (same as Pricing Alerts)
+        const windowCtx = (label, fromDay, toDay, short) => {
+          const open = openDates(bookings, prop.id, addDays(todayStr, fromDay), addDays(todayStr, toDay)).length;
+          const span = toDay - fromDay;
+          const bookedPct = Math.round((span - open) / span * 100);
+          const mkt = settings ? windowOcc(settings.market_occupancy_next_30, settings.market_occupancy_next_60, toDay) : null;
+          return `${label}: ${bookedPct}%${short ? '' : ' booked'}${mkt != null ? ` (market ${Math.round(mkt * 100)}%)` : ''}, ${open} open.`;
+        };
         actions.push({
           level: 'yellow', priority: 4, anchor: '#section-pace', sectionLabel: 'Booking Pace',
           text: `${prop.name}: ${ourNights} night${ourNights !== 1 ? 's' : ''} picked up in 7 days vs. market ${x} per listing. Check price position, minimum stay, and listing visibility.`,
+          detail: `${windowCtx('Days 1–30', 0, 30, false)} ${windowCtx('Days 31–60', 30, 60, true)}`,
         });
       }
     }
@@ -2825,7 +2835,8 @@ function sectionPriorityBoard({ summaries, portfolioNote }, todayStr) {
         const c    = ACTION_COLOR[a.level] || '#555';
         const jump = !a.anchor ? '' : `<a href="${a.anchor}" style="font-size:11px;color:#406A94;text-decoration:none;font-weight:600;margin-left:10px;white-space:nowrap;">↓ ${a.sectionLabel}</a>`;
         const sep  = i < top.length - 1 || rest ? 'border-bottom:1px solid #f3f4f6;' : '';
-        return `<div style="padding:8px 0;${sep}font-size:13px;line-height:1.5;color:${c};">→ ${boldDollars(a.text)}${jump}</div>`;
+        const detail = a.detail ? `<div style="font-size:11px;color:#777;margin-top:2px;">${a.detail}</div>` : '';
+        return `<div style="padding:8px 0;${sep}font-size:13px;line-height:1.5;color:${c};">→ ${boldDollars(a.text)}${jump}${detail}</div>`;
       }).join('');
       const more = rest
         ? `<div style="padding:8px 0;font-size:12px;color:#888;">${prop.name}: ${rest} more item${rest !== 1 ? 's' : ''} (see the sections below)</div>`

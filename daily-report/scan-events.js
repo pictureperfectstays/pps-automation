@@ -9,6 +9,7 @@ import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 import { MARKETS, MARKET_COORDS } from './events-calendar.js';
+import { datesOk, isListing, cleanCachedWebEvents } from './event-rules.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -412,10 +413,6 @@ async function tavilySearch(query) {
   return data.results || [];
 }
 
-function isValidIsoDate(s) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(s + 'T00:00:00Z'));
-}
-
 async function webSearchEvents(year) {
   if (!TAVILY_KEY) return [];
   const allFound = [];
@@ -430,7 +427,7 @@ async function webSearchEvents(year) {
       if (!results.length) { await new Promise(r => setTimeout(r, 200)); continue; }
 
       const allText = results.map(r => `${r.title} ${r.content}`).join(' ');
-      const dates   = extractDateRanges(allText, y);
+      const dates   = extractDateRanges(allText, y).filter(d => datesOk({ start_date: d.start, end_date: d.end }));
 
       if (dates.length > 0) {
         const { start, end } = dates[0];
@@ -457,17 +454,19 @@ async function webSearchEvents(year) {
       for (const r of results) {
         if (SKIP_TITLE.test(r.title)) continue;
         const text  = `${r.title} ${r.content}`;
-        const dates = extractDateRanges(text, y);
-        if (!dates.length) continue;
         if (!HIGH_KW.test(text) && !VERY_HIGH_KW.test(text)) continue; // require impact signal
+        const name = r.title.split(/[|\-–]/)[0].trim().slice(0, 80);
+        if (isListing(name, r.url) || isListing(r.title, '')) continue; // listing pages and social posts
+        const dates = extractDateRanges(text, y).filter(d => datesOk({ start_date: d.start, end_date: d.end }));
+        if (!dates.length) continue;
 
         const { start, end } = dates[0];
-        const name = r.title.split(/[|\-–]/)[0].trim().slice(0, 80);
         const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40);
         allFound.push({
           id: `web-discover-${slug}-${start}`, name, market,
           start_date: start, end_date: end,
-          impact: VERY_HIGH_KW.test(text) ? 'very-high' : 'high',
+          // A broad search can't confirm size; finds start at moderate (no alert)
+          impact: 'moderate',
           is_watch: false, source: 'web-search',
           notes: `Discovered via web search. Source: ${r.url}`,
           discovered_at: new Date().toISOString(),
@@ -477,7 +476,7 @@ async function webSearchEvents(year) {
     }
   }
 
-  return allFound.filter(ev => isValidIsoDate(ev.start_date) && isValidIsoDate(ev.end_date));
+  return allFound.filter(datesOk);
 }
 
 // ─── Merge & Dedup ────────────────────────────────────────────────────────────
@@ -632,9 +631,16 @@ async function main() {
 
   // 2. Prune stale events (past end_date by >30 days) to keep cache tidy
   const pruneDate = addDays(todayStr, -30);
-  const pruned = existingEvents.filter(ev => ev.end_date >= pruneDate);
-  if (pruned.length < existingEvents.length) {
-    console.log(`  Pruned ${existingEvents.length - pruned.length} past events`);
+  const current = existingEvents.filter(ev => ev.end_date >= pruneDate);
+  if (current.length < existingEvents.length) {
+    console.log(`  Pruned ${existingEvents.length - current.length} past events`);
+  }
+  // Drop cached web-search entries that fail the sanity rules (listing pages,
+  // social posts, bad date spans); broad-search finds held at moderate
+  const { kept: pruned, dropped } = cleanCachedWebEvents(current);
+  if (dropped.length) {
+    console.log(`  Cleaned ${dropped.length} web-search entr${dropped.length !== 1 ? 'ies' : 'y'} from the cache:`);
+    for (const ev of dropped) console.log(`    - ${ev.name} (${ev.start_date} – ${ev.end_date})`);
   }
 
   // 3. Fetch fresh events from all sources

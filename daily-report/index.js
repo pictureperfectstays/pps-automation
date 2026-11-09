@@ -35,7 +35,6 @@ const SUPABASE_URL = ENV.SUPABASE_URL;
 const SUPABASE_KEY = ENV.SUPABASE_SERVICE_KEY;
 const RESEND_KEY = ENV.RESEND_API_KEY;
 const PRICELABS_KEY = ENV.PRICELABS_API_KEY;
-const ANTHROPIC_KEY = ENV.ANTHROPIC_API_KEY;
 const PL_DATA_FILE = ENV.PRICELABS_DATA_FILE; // fallback: load from file if set (local runs only)
 const IS_CI = ENV.GITHUB_ACTIONS === 'true';
 // Run log identity: GITHUB_REF is e.g. refs/heads/main; local runs log as 'local'
@@ -398,8 +397,31 @@ function stayRentPerNight(booking) {
 
 const CANCEL_SELECT = 'id,property_id,status,guest_display_name,arrival_date,departure_date,nights,gross_revenue,booking_channel,booked_at,canceled_at,last_active_gross,charges_json';
 
-async function fetchRecentActivity() {
-  const since = new Date(Date.now() - 25 * 3600 * 1000).toISOString();
+// Activity window: since the start of the last report sent from this git ref on an
+// earlier Arizona date (so a forced re-send today shows the same window as the first
+// send); 24 hours if there is none.
+async function activitySince(todayStr) {
+  const [last] = await sb(
+    `daily_report_runs?select=started_at&git_ref=eq.${encodeURIComponent(GIT_REF)}&report_date=lt.${todayStr}`
+    + `&status=in.(sent,sent_with_failures)&order=started_at.desc&limit=1`
+  );
+  return last?.started_at
+    ? { since: new Date(last.started_at).toISOString(), fromLastRun: true }
+    : { since: isoAt(Date.now() - 24 * 3600 * 1000), fromLastRun: false };
+}
+
+// "Since Sun Nov 8, 10:48 PM" (Arizona time) for the activity heading
+function activityLabel(window) {
+  if (!window?.fromLastRun) return 'Last 24 Hours';
+  const ms = Date.parse(window.since);
+  const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Phoenix' }).format(new Date(ms));
+  const time = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Phoenix', hour: 'numeric', minute: '2-digit' }).format(new Date(ms));
+  return `Since Last Report (${fmtDateL(day)}, ${time})`;
+}
+
+async function fetchRecentActivity(todayStr) {
+  const window = await activitySince(todayStr);
+  const { since } = window;
   const ids = propIdList();
   const [newBookings, cancelled] = await Promise.all([
     sb(`bookings?select=id,property_id,status,guest_display_name,arrival_date,departure_date,nights,gross_revenue,booking_channel,booked_at,charges_json&property_id=in.(${ids})&status=eq.active&booked_at=gte.${since}&order=booked_at.desc`),
@@ -415,7 +437,7 @@ async function fetchRecentActivity() {
     }
     return { ...c, rebookedNights, rebookedGross };
   }));
-  return { newBookings, cancellations };
+  return { newBookings, cancellations, window };
 }
 
 // MTD split by night, gross, same rule as the portal dashboard
@@ -1339,6 +1361,8 @@ const FORECAST_RATIO_MIN_NIGHTS = 7;
 const FORECAST_RATIO_RANGE = [0.8, 2.0];
 // Years of late-booked history used to cap the value of an open night
 const LATE_ADR_YEARS = 3;
+// The cap applies only when it rests on at least this many late-booked nights
+const LATE_ADR_MIN_NIGHTS = 7;
 function bookedPriceRatios(bookings, plData, todayStr) {
   const t90 = addDays(todayStr, 90);
   const sums = {};
@@ -1522,8 +1546,9 @@ function computePropertyForecast(prop, paceMonth, todayStr, tyBookings, tyBlocke
     ? pricedOpenDates.reduce((s, d) => s + propPrices[d].price, 0) / pricedOpenDates.length
     : null;
   const plValue  = avgPLPrice != null && ratioInfo?.ratio ? avgPLPrice * ratioInfo.ratio : null;
-  // Valued at the lower of today's price × ratio and what late-booked nights earned
-  const priceCapped = plValue != null && lateADR != null && lateADR < plValue;
+  // Valued at the lower of today's price × ratio and what late-booked nights earned,
+  // when the late-booked average rests on at least LATE_ADR_MIN_NIGHTS nights
+  const priceCapped = plValue != null && lateADR != null && lateNightsSum >= LATE_ADR_MIN_NIGHTS && lateADR < plValue;
   const avgPrice    = priceCapped ? lateADR : plValue;
 
   // Expected nights filled (base) vs nights filled after this point in past years
@@ -1545,7 +1570,7 @@ function computePropertyForecast(prop, paceMonth, todayStr, tyBookings, tyBlocke
 
   return {
     prop, paceMonth, confirmedRevenue, confirmedNights, openNights, availableDays,
-    avgFillRate, avgPrice, plValue, lateADR, lateADRYears, priceCapped,
+    avgFillRate, avgPrice, plValue, lateADR, lateADRYears, lateNights: lateNightsSum, priceCapped,
     expectedNights, pastRange, fillRates, fullyBookedYears,
     conservative, base, optimistic, lyActualRevenue,
     isFullyBooked, isRedFlag,
@@ -1994,7 +2019,7 @@ function sectionRevenueForecast(paceMonths, todayStr, tyBookings, tyBlocked, his
 
   html += `<p style="font-size:11px;color:#aaa;margin:8px 0 0;">
     All amounts are gross (cleaning and taxes included), prorated for bookings spanning month boundaries.
-    Open nights are valued at the lower of (a) the PriceLabs price × each property's booked-gross ratio (booked gross ÷ PriceLabs price on its booked nights in the next 90 days: ${ratioNote(ratios)}) and (b) the average gross per night that nights booked after this calendar date earned in the same month over the last ${LATE_ADR_YEARS} years with such bookings (fewer if that's all the history). "late-booked avg" marks where (b) is used, with (a) shown as PL.
+    Open nights are valued at the lower of (a) the PriceLabs price × each property's booked-gross ratio (booked gross ÷ PriceLabs price on its booked nights in the next 90 days: ${ratioNote(ratios)}) and (b) the average gross per night that nights booked after this calendar date earned in the same month over the last ${LATE_ADR_YEARS} years with such bookings (fewer if that's all the history); (b) is used only when it rests on ${LATE_ADR_MIN_NIGHTS} or more late-booked nights. "late-booked avg" marks where (b) is used, with (a) shown as PL.
     Fill rate = % of open nights at this same calendar date historically that were booked by month-end, averaged across all available prior years. exp. = open nights × fill rate (base); past = nights filled after this date in those years (lowest–highest).
     Scenarios: Conservative = 50% of fill rate · Base = 100% · Optimistic = 130%.
     <span style="display:inline-block;background:#fff5f5;color:#c0392b;padding:1px 5px;border-radius:3px;margin-top:2px;">Red row</span> = base projection &gt;15% below last year's actual.
@@ -2264,12 +2289,13 @@ function rebookedText(b, nights) {
     : `Rebooked: ${b.rebookedNights} of ${nights} nights, ${fmt$(b.rebookedGross)}`;
 }
 
-function sectionActivity({ newBookings, cancellations }) {
+function sectionActivity({ newBookings, cancellations, window }) {
+  const label = activityLabel(window);
   if (!newBookings.length && !cancellations.length) {
-    return `<h2 id="section-activity" style="${H2}">🔔 Activity — Last 24 Hours</h2>
-    <p style="color:#888;margin:8px 0;font-style:italic;">No new bookings or cancellations in the last 24 hours.</p>`;
+    return `<h2 id="section-activity" style="${H2}">🔔 Activity — ${label}</h2>
+    <p style="color:#888;margin:8px 0;font-style:italic;">No new bookings or cancellations ${window?.fromLastRun ? 'since the last report' : 'in the last 24 hours'}.</p>`;
   }
-  let html = `<h2 id="section-activity" style="${H2}">🔔 Activity — Last 24 Hours</h2>`;
+  let html = `<h2 id="section-activity" style="${H2}">🔔 Activity — ${label}</h2>`;
   if (newBookings.length) {
     html += `<p style="font-weight:600;margin:8px 0 4px;color:#1a7f5a;">✓ ${newBookings.length} New Booking${newBookings.length > 1 ? 's' : ''}</p>`;
     for (const b of newBookings) {
@@ -2609,7 +2635,7 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
     // · 4 RED pricing · 5 YELLOW pricing · 6 no recent bookings · 7 pace · 8 underpriced events
     const actions = [];
 
-    // Cancellations for this property in last 24h (fully rebooked ones stay in Activity only)
+    // Cancellations for this property since the last report (fully rebooked ones stay in Activity only)
     for (const c of (activity.cancellations || [])) {
       if (c.property_id !== prop.id) continue;
       const nights = c.nights || Math.max(1, diffDays(c.arrival_date, c.departure_date));
@@ -2650,6 +2676,8 @@ function buildPropertySummaries(plData, alertData, bookings, lastBookedMap, acti
     const underByNight = new Map(); // "start|end" → { start, end, names, pct }
     for (const ev of upcomingEvents90(hardcodedEvents, cachedEvents, todayStr)) {
       if (ev.market !== prop.market) continue;
+      // Broad web-search finds are moderate until confirmed; they don't come onto the board
+      if (ev.source === 'web-search' && ev.impact === 'moderate') continue;
       const under = eventUnderpricedPct(ev, prop, plData, histActive, todayStr);
       if (!under) continue;
       const key = `${ev.start_date}|${ev.end_date}`;
@@ -2865,7 +2893,7 @@ async function main() {
   const paceMonths = getPaceMonths(todayStr);
   const cachedEvents = fetchEventsCache(todayStr);
   const [activity, mtd, bookings, taxProfiles, paceData, forecastData, lastBookedMap, pickup] = await Promise.all([
-    step('Recent activity', fetchRecentActivity),
+    step('Recent activity', () => fetchRecentActivity(todayStr)),
     step('Month-to-date revenue', () => fetchMTDRevenue(todayStr)),
     step('Bookings (next 90 days)', () => fetchBookings90(todayStr, t90)),
     step('Tax profiles', fetchTaxProfiles),
@@ -2939,7 +2967,7 @@ async function main() {
 
   const sections = [
     mtd       ? sectionMTD(mtd, todayStr) : sectionUnavailable('section-mtd', '📊 Month-to-Date Revenue'),
-    activity  ? sectionActivity(activity) : sectionUnavailable('section-activity', '🔔 Activity — Last 24 Hours'),
+    activity  ? sectionActivity(activity) : sectionUnavailable('section-activity', '🔔 Activity'),
     sectionPricingAlerts(plData, alertData, bookings, todayStr),
     sectionSmartEvents(hardcodedEvents, cachedEvents, plData, histActive ?? [], todayStr),
     sectionOpenNights(bookings, todayStr, taxProfiles, plData),

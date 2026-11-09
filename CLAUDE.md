@@ -115,7 +115,7 @@ body: { listings: [{ id: "471179", pms: "ownerrez", min: 105, base: 228 }] }
 - **VRBO:** 10% markup, 8% fee (5% VRBO + 3% payment processing)
 - **Booking.com:** 30% markup, 18% fee
 - **Direct:** 0% markup, 0% fee
-- Gap discount base = OwnerRez `charges_json` rent / nights (= PriceLabs net target, markup not in charges_json)
+- Gap discount base = the adjacent guest's own rent per night from OwnerRez `charges_json` (all rent-category lines, including rent discounts, ÷ nights). The channel markup IS in that rent line; cleaning, fees and taxes are not
 - Gap discount formula: discounted_rent = base × (1 - pct), guest_pays = discounted_rent × (1 + tax_rate), your_net = discounted_rent × (1 - channel_fee)
 
 ## Tax Rates (in Supabase `tax_rules` table, loaded at runtime)
@@ -142,7 +142,7 @@ body: { listings: [{ id: "471179", pms: "ownerrez", min: 105, base: 228 }] }
   - Sends from `reports@mail.staypictureperfect.com` via Resend
   - Logo + Instagram icon hosted on Supabase Storage (`assets` bucket)
   - GitHub Actions workflows created (`.github/workflows/`): `daily-report.yml` (7am AZ) + `scan-events.yml` (Mon/Thu 5am AZ)
-  - **Secrets still need adding to GitHub repo** (see below)
+  - GitHub Actions secrets are in place (see below)
 - **Pricing Alerts (COMPLETE)** — proactive RED/YELLOW per property × 3 windows
   - Uses `price` field only (final channel price, not user_price/uncustomized_price)
   - Neighborhood data category = bedroom count key; Y_values for Occ is double-nested (Y_values[0][0])
@@ -172,10 +172,11 @@ body: { listings: [{ id: "471179", pms: "ownerrez", min: 105, base: 228 }] }
   - Historical ADR: prorated from `histActive` bookings on same dates in prior years
 - **Priority Action Board (COMPLETE)** — rule-based full-report action summary at top of email
   - No AI API needed — pure JavaScript, always runs
-  - Aggregates ALL actionable items from every section, ranked by priority:
-    1. RED pricing alerts | 2. Cancellations (24h) | 3. Gap nights + HIGH events ≤30d
-    4. YELLOW pricing alerts | 5. HIGH events 31-60d + no booking >21d with open nights
-    6. Booking pace >20% behind LY | 7. MTD portfolio >15% behind LY
+  - Aggregates actionable items from every section, ranked by priority:
+    1. Data failures | 2. Cancellations since the last report | 3. 1-night gaps (next 14 days)
+    4. RED pricing alerts | 5. YELLOW pricing alerts | 6. No recent bookings with open nights
+    7. Booking pace behind LY | 8. Underpriced events (one per property, last, no jump link)
+  - Events otherwise stay in the Events section, not on the board
   - Data: reuses plData, alertData, bookings, events; adds MAX(booked_at) Supabase query per property
   - Each item has a color-coded badge, specific dollar amounts (bolded), and a "↓ Jump" anchor link
   - All 8 section h2 tags have `id` attributes for in-email anchor navigation (Gmail desktop supported)
@@ -184,9 +185,9 @@ body: { listings: [{ id: "471179", pms: "ownerrez", min: 105, base: 228 }] }
   - `loadEnv()` now merges both `~/.claude/settings.json` AND `daily-report/settings.json`
 
 ## Current email section order
-0. Priority Action Board (AI briefing — above everything else)
+0. Priority Action Board (rule-based — above everything else)
 1. Month-to-Date Revenue
-2. Activity — Last 24 Hours
+2. Activity — Since Last Report (since the last report sent from the same branch on an earlier day; 24 hours if none)
 3. Pricing Alerts
 4. Smart Event Detection
 5. Open Nights & Gap Opportunities
@@ -194,18 +195,12 @@ body: { listings: [{ id: "471179", pms: "ownerrez", min: 105, base: 228 }] }
 7. Revenue Forecast
 8. Pricing — Open Days (Next 90)
 
-## GitHub Actions secrets needed (not yet added)
-Go to repo Settings → Secrets → Actions → New repository secret:
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_KEY`
-- `RESEND_API_KEY`
-- `PRICELABS_API_KEY`
-- `TICKETMASTER_API_KEY`
-- `ANTHROPIC_API_KEY`
+## GitHub Actions secrets (in place)
+- Daily report (`daily-report.yml`): `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `RESEND_API_KEY`, `PRICELABS_API_KEY`
+- Event scan (`scan-events.yml`): adds `TICKETMASTER_API_KEY` and `TAVILY_API_KEY`
+- `ANTHROPIC_API_KEY` is still stored as a secret but no workflow uses it (the Action Board is rule-based)
 
 ## Next sessions — work remaining
-
-**To activate Priority Action Board:** add `ANTHROPIC_API_KEY` to `~/.claude/settings.json` under `env`, and add as a GitHub Actions secret (see secrets list above).
 
 **Also needed — Owner Revenue Report**
 - Property-specific report (one per owner, showing only their property's data)
